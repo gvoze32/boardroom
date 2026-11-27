@@ -165,11 +165,22 @@ impl PlayerDb {
     }
 
     /// Offset of the player's record in `records`, after checking it is his.
+    /// Players past the first 65,535 (FL Mod Studio worlds) have 0xFFFF as
+    /// internal id, in the rosters and in their record: found by player id.
     pub fn record(&self, records: &[u8], p: &Player) -> Result<usize, Error> {
+        let internal_at = |off: usize| u16::from_le_bytes([records[off + R_INTERNAL], records[off + R_INTERNAL + 1]]) as u32;
+        if p.internal_id & 0xFFFF == 0xFFFF {
+            let found: Vec<usize> = (0..records.len() / RECORD)
+                .map(|i| i * RECORD)
+                .filter(|&off| le32(records, off + R_PLAYER) == p.player_id && internal_at(off) == 0xFFFF)
+                .collect();
+            return match found[..] {
+                [off] => Ok(off),
+                _ => Err(missing(p)),
+            };
+        }
         let off = (p.internal_id & 0xFFFF) as usize * RECORD;
-        let r = records.get(off..off + RECORD).ok_or_else(|| missing(p))?;
-        let internal = u16::from_le_bytes([r[R_INTERNAL], r[R_INTERNAL + 1]]) as u32;
-        if internal != p.internal_id & 0xFFFF || le32(r, R_PLAYER) != p.player_id {
+        if off + RECORD > records.len() || internal_at(off) != p.internal_id & 0xFFFF || le32(records, off + R_PLAYER) != p.player_id {
             return Err(missing(p));
         }
         Ok(off)

@@ -204,6 +204,15 @@ as administrator too.
   again by the app; none has been loaded in the game after editing yet. Check
   your squad, budget and league table in the game. For FL27 player names, OVR
   and ages, choose the FL27 game folder (step 4).
+- **FL Mod Studio worlds** (such as GigaPack by MatoZanato, about 150 MB
+  saves) open like any other save: the app measures where Mod Studio's bigger
+  tables have moved the budget, manager and transfer lists. Checked on two
+  GigaPack saves (budget, salary budget and manager name match the game);
+  none has been loaded in the game after editing yet. If a save's layout
+  can't be measured, budget, manager and agreed deals are locked instead of
+  guessed. The club list has all the world's clubs (5,080 in GigaPack).
+- **Manager name**: up to v0.3.3 the app showed and changed the wrong coach
+  (another club's). It now changes your own manager.
 - **Writing into the running game** has not been tried in the game yet.
   Back up your save folder first and check the changes in the game before you
   save there. Transfers and loans put a small piece of code into the running

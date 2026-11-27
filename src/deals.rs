@@ -16,6 +16,9 @@
 //! | News | `0xBE3360`, 56 bytes | type `0x6E`, internal id, player id, filler, agreement date |
 //! | Negotiation timeline | table + `0x587A4`, 100-byte blocks | see `TIMELINE_OFFSET` |
 //!
+//! The fixed offsets are those of the plain game; Mod Studio saves move them
+//! (`masterleague::Layout`).
+//!
 //! A free agent's deal has no offer, no season-deal row and no timeline.
 //! Offer ids and contract indexes share one numbering: the lowest free number
 //! is the offer id and the next free one the contract index (a free agent's
@@ -37,7 +40,7 @@ use std::collections::BTreeSet;
 
 use crate::Error;
 use crate::contracts::{ContractTable, Date, RECORD, words};
-use crate::masterleague::Player;
+use crate::masterleague::{Layout, Player};
 
 const HEADER_MAGIC: u32 = 0x0007_4574;
 /// Offers start after the 1140 contract slots (offset from contract slot 0).
@@ -136,8 +139,10 @@ fn is_offer_blank(w: &[u32; 15]) -> bool {
     w[0] & 0xFFFF == 0xFFFF && w[1] == 0xFFFF_FFFF && w[7] == 0xFFFF_FFFF && w[9] == 0 && w[10] == 0 && w[12] & 0xFFFF == 0xFFFF
 }
 
+/// Players past the first 65,535 (Mod Studio worlds) have 0xFFFF as internal
+/// id, so a used row is told apart from a free one by its player id.
 fn is_offer(w: &[u32; 15]) -> bool {
-    w[0] & 0xFFFF < 2000 && w[1] != 0xFFFF_FFFF && w[7] != 0xFFFF_FFFF && w[8] & 0xFFFF != 0xFFFF && w[9] != 0
+    w[0] & 0xFFFF < 2000 && w[1] != 0xFFFF_FFFF && w[7] != 0xFFFF_FFFF && w[9] != 0
 }
 
 /// Index of the first free entry among `max` entries classified by `entry`;
@@ -195,16 +200,23 @@ pub struct DealTables {
     offers: usize,
     offer_count: usize,
     agreed_free: usize,
+    pending: usize,
     pending_free: usize,
+    season_deals: usize,
     deal_free: usize,
     /// Offset of the first free timeline slot.
     timeline_free: usize,
+    news: usize,
     news_free: usize,
 }
 
 impl DealTables {
-    pub fn locate(data: &[u8], table: &ContractTable) -> Result<DealTables, Error> {
+    /// The tables, checked; `layout` = where this save keeps the fixed-offset ones (`None` = unknown).
+    pub fn locate(data: &[u8], table: &ContractTable, layout: Option<Layout>) -> Result<DealTables, Error> {
         let unknown = || Error::new("This save's transfer lists don't match the known layout, so an agreed deal can't be written.");
+        let layout = layout.ok_or_else(unknown)?;
+        let (pending, season_deals, news) =
+            (layout.upper(PENDING_ARRIVALS), layout.upper(SEASON_DEALS), layout.middle(NEWS));
         let header = table.first.checked_sub(RECORD).and_then(|o| words(data, o)).ok_or_else(unknown)?;
         if header[8] != HEADER_MAGIC || header[9..12] != [0, 0, 0] {
             return Err(unknown());
@@ -232,19 +244,19 @@ impl DealTables {
         })
         .ok_or_else(unknown)?;
         let pending_free = first_free(MAX_PENDING, |i| {
-            let [iid, pid, salary] = u32s::<3>(data, PENDING_ARRIVALS + i * PENDING_ENTRY)?;
+            let [iid, pid, salary] = u32s::<3>(data, pending + i * PENDING_ENTRY)?;
             Some(match (iid, pid, salary) {
                 (0xFFFF, 0, 0) => Entry::Free,
-                (iid, pid, salary) if iid & 0xFFFF != 0xFFFF && pid != 0 && salary != 0 => Entry::Used,
+                (_, pid, salary) if pid != 0 && salary != 0 => Entry::Used,
                 _ => Entry::Unknown,
             })
         })
         .ok_or_else(unknown)?;
         let deal_free = first_free(MAX_DEALS, |i| {
-            let w = u32s::<13>(data, SEASON_DEALS + i * DEAL_ENTRY)?;
+            let w = u32s::<13>(data, season_deals + i * DEAL_ENTRY)?;
             Some(if w[0] == 0xFFFF && w[1..12].iter().all(|&x| x == 0) && w[12] == 0xFFFF {
                 Entry::Free
-            } else if w[0] & 0xFFFF != 0xFFFF && w[1] != 0 && w[2..8].iter().all(|&x| x == 0) && w[12] == 0xFFFF {
+            } else if w[1] != 0 && w[2..8].iter().all(|&x| x == 0) && w[12] == 0xFFFF {
                 Entry::Used
             } else {
                 Entry::Unknown
@@ -278,7 +290,7 @@ impl DealTables {
         .ok_or_else(unknown)?;
         let timeline_free = timeline + timeline_slot * TIMELINE_SLOT;
         let news_free = first_free(MAX_NEWS, |i| {
-            let w = u32s::<14>(data, NEWS + i * NEWS_ROW)?;
+            let w = u32s::<14>(data, news + i * NEWS_ROW)?;
             Some(if w == BLANK_NEWS {
                 Entry::Free
             } else if w[0] & 0xFF != 0xFF && w[13] != 0xFFFF && Date::unpack(w[13]).is_some() {
@@ -288,7 +300,7 @@ impl DealTables {
             })
         })
         .ok_or_else(unknown)?;
-        Ok(DealTables { offers, offer_count, agreed_free, pending_free, deal_free, timeline_free, news_free })
+        Ok(DealTables { offers, offer_count, agreed_free, pending, pending_free, season_deals, deal_free, timeline_free, news, news_free })
     }
 
     fn offer_rows(&self, data: &[u8]) -> Vec<[u32; 15]> {
@@ -369,10 +381,10 @@ impl DealTables {
         let agreed: Vec<u8> = [offer_id as u16, NONE16, NONE16].iter().flat_map(|v| v.to_le_bytes()).collect();
         Ok(vec![
             (self.offers + self.offer_count * OFFER_RECORD, encode(offer)),
-            (SEASON_DEALS + self.deal_free * DEAL_ENTRY, encode(season)),
+            (self.season_deals + self.deal_free * DEAL_ENTRY, encode(season)),
             (self.timeline_free, Self::timeline_rounds(offer_id, rounds)),
             (table.first + AGREED_OFFSET + self.agreed_free * AGREED_ENTRY, agreed),
-            (NEWS + self.news_free * NEWS_ROW, encode(news)),
+            (self.news + self.news_free * NEWS_ROW, encode(news)),
         ])
     }
 
@@ -415,7 +427,7 @@ impl DealTables {
                 patches.push((self.offers + self.offer_count * OFFER_RECORD, encode(offer)));
                 let fee = (-(deal.fee_units as i64)) as i32 as u32;
                 let season = [p.internal_id, p.player_id, 0, 0, 0, 0, 0, 0, fee, SEASON_PERMANENT, 0, 0, 0xFFFF];
-                patches.push((SEASON_DEALS + self.deal_free * DEAL_ENTRY, encode(season)));
+                patches.push((self.season_deals + self.deal_free * DEAL_ENTRY, encode(season)));
                 // A timeline slot as in the game: an offer block and a contract
                 // block, each with the club accepting and the player's contract
                 // talks until the window closes.
@@ -429,13 +441,13 @@ impl DealTables {
         };
         let pair: Vec<u8> = pair.iter().flat_map(|v| v.to_le_bytes()).collect();
         patches.push((table.first + AGREED_OFFSET + self.agreed_free * AGREED_ENTRY, pair));
-        patches.push((PENDING_ARRIVALS + self.pending_free * PENDING_ENTRY, encode([p.internal_id, p.player_id, deal.salary_units])));
+        patches.push((self.pending + self.pending_free * PENDING_ENTRY, encode([p.internal_id, p.player_id, deal.salary_units])));
         let mut news = BLANK_NEWS;
         news[0] = NEWS_DEAL_AGREED;
         news[1] = p.internal_id;
         news[2] = p.player_id;
         news[13] = deal.today.pack();
-        patches.push((NEWS + self.news_free * NEWS_ROW, encode(news)));
+        patches.push((self.news + self.news_free * NEWS_ROW, encode(news)));
         Ok(patches)
     }
 }

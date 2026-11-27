@@ -807,3 +807,53 @@ fn rounding_matches_python_ties_to_even() {
     assert_eq!(ml::div_round_even(-12_345_678, 100), -123_457);
     assert_eq!(ml::fmt_eur(12_345_678), "€12,345,678");
 }
+
+#[test]
+fn mod_studio_layout_is_measured_and_every_moved_table_follows_it() {
+    // FL Mod Studio grows the club table (the coach table moves behind it) and
+    // the arrays before "My Team" (everything after them moves).
+    let layout = ml::Layout { team_cap: 800, middle_shift: 0x8000 };
+    let mut game = open_with(&TempDir::new("mod-studio"), build_data_in(false, &player_records(), layout));
+    assert_eq!(game.layout, Some(layout));
+    assert_eq!(game.finances().unwrap(), Finances { transfer_eur: 50_000_000, salary_eur: 20_000_000 });
+    game.set_manager_name("New Coach").unwrap();
+    for at in manager_names_in(layout) {
+        assert_eq!(&game.data[at..at + 10], b"New Coach\0");
+    }
+    // An agreed signing writes the moved lists.
+    let target = club_player(7, 2);
+    game.transfer(agreed(7, target.player_id)).unwrap();
+    assert_eq!(game.finances().unwrap().transfer_eur, 50_000_000 - 12_345_700);
+    assert_eq!(wordsn::<3>(&game.data, layout.upper(deals::PENDING_ARRIVALS)), [target.internal_id, target.player_id, 25_000]);
+    assert_eq!(wordsn::<3>(&game.data, layout.middle(deals::NEWS) + deals::NEWS_ROW), [0x6E, target.internal_id, target.player_id]);
+    // A sale takes the player off the moved "My Team" list.
+    let seller = club_player(MANAGED, 2);
+    game.transfer(TransferRequest::new(Source::Club(MANAGED), 7, seller.player_id)).unwrap();
+    let listed: Vec<u32> = (0..64)
+        .map(|k| wordsn::<4>(&game.data, layout.middle(ml::MY_TEAM) + k * ml::MY_TEAM_ROW))
+        .take_while(|r| r[3] != 0xC7)
+        .map(|r| r[1])
+        .collect();
+    assert_eq!(listed, (0..SQUAD).rev().filter(|&j| j != 2).map(|j| club_player(MANAGED, j).player_id).collect::<Vec<_>>());
+}
+
+#[test]
+fn grown_save_without_my_team_locks_the_moved_tables() {
+    // The shift can't be measured: nothing at a guessed offset is read or written.
+    let layout = ml::Layout { team_cap: 800, middle_shift: 0x8000 };
+    let mut data = build_data_in(false, &player_records(), layout);
+    put_words(&mut data, layout.middle(ml::MY_TEAM_CLUB), &[0]);
+    let mut game = open_with(&TempDir::new("mod-studio-unknown"), data);
+    assert_eq!(game.layout, None);
+    assert!(game.finances().is_err() && game.manager_name().is_err());
+    let target = club_player(7, 2);
+    let op = game.transfer(incoming(7, target.player_id, 0, 2_500_049, date(2029, 8, 31))).unwrap();
+    assert!(op.description.contains("joined right away"));
+}
+
+#[test]
+fn dotted_date_in_the_description_is_read() {
+    let dir = TempDir::new("dotted-date");
+    let path = write_save_as(&dir.0.join("ML00000001"), build_data(false), "SP Football Life 2027", "Club 0 / Bundesliga\n12.9.2026\nBundesliga");
+    assert_eq!(MasterLeague::open(&path).unwrap().game_date, Some(date(2026, 9, 12)));
+}

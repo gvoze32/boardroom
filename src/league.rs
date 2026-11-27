@@ -11,7 +11,9 @@
 //!   | competition (state 2 = to be played, 6 = played; round from 0); date
 //!   (`year | month << 16 | day << 24`); two unknown words; home club
 //!   reference; away club reference; score (byte 0 home goals, byte 3 away
-//!   goals); then the line-ups.
+//!   goals); then the line-ups. The plain game numbers its matches from 0; a
+//!   GigaPack (FL Mod Studio) save leaves records 0–65,535 empty and numbers
+//!   its matches from 65,536.
 //! * League table, one block per competition (`0xCB389C` for the Premier
 //!   League): header `(year << 16 | competition, competition, format, 1, …)`,
 //!   format 1 for a plain league; from +0x14 48 team rows of 16 bytes (club
@@ -25,7 +27,8 @@
 //! follows neither, or that doesn't add up to its played matches (a points
 //! deduction, say), is never changed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 use crate::Error;
 use crate::contracts::Date;
@@ -82,37 +85,53 @@ impl Fixture {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchTable {
+    /// Offset of record 0.
     pub start: usize,
-    pub count: usize,
+    /// Indexes of the records in use.
+    pub used: Range<usize>,
 }
 
 impl MatchTable {
-    /// The only place where `PROBE` consecutive records numbered from 0 with a
-    /// valid state and date start the table.
+    /// The table whose records, wherever `PROBE` consecutive ones carry
+    /// consecutive indexes with a valid state and date, all point to the same
+    /// record 0; refused when another place does too.
     pub fn locate(data: &[u8]) -> Result<MatchTable, Error> {
-        let probe = |o: usize| {
+        let probe = |o: usize, first: u32| {
             (0..PROBE).all(|k| {
                 let r = o + k * MATCH_RECORD;
-                u32_at(data, r) == k as u32
+                u32_at(data, r) == first.wrapping_add(k as u32)
                     && matches!(u32_at(data, r + 4) >> STATE_SHIFT, STATE_SCHEDULED | STATE_PLAYED)
                     && Date::unpack(u32_at(data, r + DATE)).is_some()
             })
         };
         let last = data.len().saturating_sub(PROBE * MATCH_RECORD);
-        let mut found = (0..last).step_by(4).filter(|&o| u32_at(data, o) == 0 && u32_at(data, o + MATCH_RECORD) == 1 && probe(o));
-        let start = found.next().ok_or_else(|| Error::new("Couldn't find the matches in this save."))?;
-        if found.next().is_some() {
+        let mut starts = BTreeSet::new();
+        let mut first_used = None;
+        for o in (0..last).step_by(4) {
+            let index = u32_at(data, o);
+            if index < u32::MAX && u32_at(data, o + MATCH_RECORD) == index + 1 && probe(o, index) {
+                if let Some(start) = o.checked_sub(index as usize * MATCH_RECORD) {
+                    if starts.insert(start) && starts.len() == 1 {
+                        first_used = Some(index as usize);
+                    }
+                }
+            }
+        }
+        let (Some(&start), Some(first)) = (starts.first(), first_used) else {
+            return Err(Error::new("Couldn't find the matches in this save."));
+        };
+        if starts.len() > 1 {
             return Err(Error::new("The matches in this save couldn't be told apart from other data."));
         }
-        let count = (0..)
+        let count = (first..)
             .take_while(|&k| {
                 let r = start + k * MATCH_RECORD;
                 r + MATCH_RECORD <= data.len() && u32_at(data, r) == k as u32
             })
             .count();
-        Ok(MatchTable { start, count })
+        Ok(MatchTable { start, used: first..first + count })
     }
 
     fn offset(&self, index: usize) -> usize {
@@ -137,7 +156,7 @@ impl MatchTable {
     }
 
     pub fn fixtures<'a>(&'a self, data: &'a [u8]) -> impl Iterator<Item = Fixture> + 'a {
-        (0..self.count).map(move |k| self.fixture(data, k))
+        self.used.clone().map(move |k| self.fixture(data, k))
     }
 }
 
@@ -359,7 +378,7 @@ impl League {
     /// The bytes to write for a new score of a played league match: the score
     /// word and the whole table, re-sorted the way the league sorts it.
     pub fn new_score(&self, data: &[u8], index: usize, home_goals: u8, away_goals: u8) -> Result<Vec<(usize, Vec<u8>)>, Error> {
-        if index >= self.matches.count {
+        if !self.matches.used.contains(&index) {
             return Err(Error::new("Match not found."));
         }
         let f = self.matches.fixture(data, index);

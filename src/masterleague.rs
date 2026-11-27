@@ -34,6 +34,10 @@
 //!   date (`Chelsea FC / Premier League\n6/8/2025\n…`).
 //! * League matches and tables: `league`.
 //!
+//! The offsets are the plain game's. An FL Mod Studio world (GigaPack: 5,080
+//! clubs, 8,000 club slots) grows the tables and moves the ones after them;
+//! `Layout` measures where each save keeps them.
+//!
 //! Every edit goes through `patch` (data block) or `patch_record` (player
 //! records), which journal the previous bytes, so undo is byte-exact and
 //! saving can prove that nothing outside the journal changed.
@@ -60,7 +64,8 @@ pub const COUNT_MASK: u16 = 0x7F;
 pub const NUMBERS_OFFSET: usize = 0x29A;
 pub const MAX_ROSTER: usize = 40;
 pub const EMPTY: Player = Player { internal_id: 0xFFFF, player_id: 0 };
-const MAX_SAVE: u64 = 80_000_000;
+/// FL Mod Studio worlds (GigaPack: 5,239 clubs) write saves of about 150 MB.
+const MAX_SAVE: u64 = 400_000_000;
 
 pub const FL26_FINANCE: usize = 0xC7DD00;
 pub const PES21_FINANCE: usize = 0xC7DE00;
@@ -87,6 +92,48 @@ pub const NATIONAL_FIRST: [&str; 4] = ["ALB", "AND", "ARM", "AUT"];
 const NATIONAL_FIRST_NAMES: [&str; 4] = ["albania", "andorra", "armenia", "austria"];
 /// Backups of overwritten saves, next to the save.
 pub const BACKUP_DIR: &str = "Boardroom_backup";
+
+/// Club table capacity of the plain game.
+pub const PLAIN_TEAMS: usize = 750;
+/// Club references keep the club index in 14 bits.
+const MAX_TEAMS: usize = 0x4000;
+/// Per-club side array between "My Team" and the finance block: 16 bytes per club slot.
+const TEAM_SIDE_ROW: usize = 0x10;
+
+/// Where the tables the editor finds at fixed offsets lie. FL Mod Studio
+/// (GigaPack and other worlds) raises the game's caps, which grows arrays in
+/// the data block and moves everything after them; the arrays and their order
+/// are those of Mod Studio's patch sets (`mlcopy.regions`), confirmed on two
+/// GigaPack saves. Measured per save, not taken from a list of sets:
+/// * the club table's capacity (`team_cap`) moves the coach table behind it;
+/// * `middle_shift` moves what lies between the calendar and the per-club side
+///   array ("My Team", news): the growth of clubs, coaches, regulations,
+///   fixtures, matches and calendar;
+/// * the side array (16 bytes per club slot) adds to that for the finance
+///   block, season deals and pending arrivals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub team_cap: usize,
+    pub middle_shift: usize,
+}
+
+impl Layout {
+    pub const PLAIN: Layout = Layout { team_cap: PLAIN_TEAMS, middle_shift: 0 };
+
+    pub fn coaches(&self) -> usize {
+        COACH_TABLE + (self.team_cap - PLAIN_TEAMS) * RECORD_SIZE
+    }
+
+    /// A table between the calendar and the side array, at `plain` in the plain game.
+    pub fn middle(&self, plain: usize) -> usize {
+        plain + self.middle_shift
+    }
+
+    /// A table after the side array, at `plain` in the plain game.
+    pub fn upper(&self, plain: usize) -> usize {
+        plain + self.middle_shift + (self.team_cap - PLAIN_TEAMS) * TEAM_SIDE_ROW
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Team {
@@ -248,6 +295,13 @@ fn u32_at(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
 }
 
+/// A NUL-padded field holding one line of UTF-8 text.
+fn name_field_ok(field: &[u8]) -> bool {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    std::str::from_utf8(&field[..end]).is_ok_and(|n| !n.trim().is_empty() && !n.chars().any(|c| c < ' '))
+        && field[end..].iter().all(|&b| b == 0)
+}
+
 fn text_at(data: &[u8], off: usize, size: usize) -> String {
     let raw = &data[off..off + size];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -265,6 +319,9 @@ pub struct MasterLeague {
     pub contracts: Option<ContractTable>,
     pub teams: Vec<Team>,
     national: Range<usize>,
+    /// Where the fixed-offset tables lie; `None` when unknown (budget, manager,
+    /// "My Team" and the deal lists are then left alone).
+    pub layout: Option<Layout>,
     finance_offset: Option<usize>,
     pub finance_error: Option<String>,
     /// Why the manager name can't be edited; `None` when it can.
@@ -315,6 +372,7 @@ impl MasterLeague {
             contracts: None,
             teams: Vec::new(),
             national: 0..0,
+            layout: None,
             finance_offset: None,
             finance_error: None,
             manager_error: None,
@@ -332,6 +390,8 @@ impl MasterLeague {
         for i in 0..game.teams.len() {
             game.raw_roster(i)?;
         }
+        game.load_players();
+        game.layout = game.discover_layout();
         match game.locate_finances() {
             Ok(offset) => game.finance_offset = Some(offset),
             Err(e) => game.finance_error = Some(e),
@@ -341,7 +401,6 @@ impl MasterLeague {
             Err(e) => game.manager_error = Some(e),
         }
         game.read_description();
-        game.load_players();
         Ok(game)
     }
 
@@ -367,7 +426,8 @@ impl MasterLeague {
         self.save.master_key == &crypto::FL27_KEY
     }
 
-    /// `"Chelsea FC / Premier League\n6/8/2025\nPremier League"` at desc+0x80.
+    /// `"Chelsea FC / Premier League\n6/8/2025\nPremier League"` at desc+0x80;
+    /// a German game writes the date as `12.9.2026`.
     fn read_description(&mut self) {
         let raw = self.save.desc.get(0x80..).unwrap_or(&[]);
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -380,7 +440,7 @@ impl MasterLeague {
         }
         self.league_name = first.and_then(|mut parts| parts.next()).map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
         self.game_date = lines.next().and_then(|line| {
-            let mut parts = line.trim().split('/').map(|p| p.parse::<u16>().ok());
+            let mut parts = line.trim().split(['/', '.']).map(|p| p.parse::<u16>().ok());
             let (d, m, y) = (parts.next()??, parts.next()??, parts.next()??);
             Date::new(y, u8::try_from(m).ok()?, u8::try_from(d).ok()?)
         });
@@ -414,7 +474,7 @@ impl MasterLeague {
     }
 
     fn discover_clubs(&self) -> Result<Vec<Team>, Error> {
-        let limit = 900.min(self.table_len().saturating_sub(4));
+        let limit = MAX_TEAMS.min(self.table_len().saturating_sub(4));
         let mut count = 0;
         for i in 0..limit {
             if self.is_national_start(i)? {
@@ -422,7 +482,7 @@ impl MasterLeague {
                 break;
             }
         }
-        if !(400..=750).contains(&count) {
+        if count < 400 {
             return Err(Error::new("Couldn't tell clubs and national teams apart; this save was not changed."));
         }
         let teams = (0..count).map(|i| self.team(i)).collect::<Result<Vec<_>, _>>()?;
@@ -446,15 +506,69 @@ impl MasterLeague {
         Ok(0..0)
     }
 
+    /// Where the tables the editor finds at fixed offsets lie in this save;
+    /// `None` when that can't be told. PES 2021 has no Mod Studio: plain layout.
+    fn discover_layout(&self) -> Option<Layout> {
+        if !self.game.contains("Football Life") {
+            return Some(Layout::PLAIN);
+        }
+        // The coach table follows the club table, so its start gives the club table's capacity.
+        let team_cap = (PLAIN_TEAMS..=MAX_TEAMS).find(|&cap| {
+            let coaches = Layout { team_cap: cap, middle_shift: 0 }.coaches();
+            (0..4).all(|j| {
+                let o = coaches + j * COACH_RECORD;
+                o + COACH_RECORD <= self.data.len()
+                    && u32_at(&self.data, o) == j as u32
+                    && name_field_ok(&self.data[o + COACH_NAME..o + COACH_NAME + MANAGER_NAME_SIZE])
+            })
+        })?;
+        // "My Team" gives the middle shift; it lies before the player records.
+        let end = self.players.as_ref().map_or(self.data.len(), PlayerDb::start);
+        let mut found = None;
+        for at in (MY_TEAM_CLUB..end.saturating_sub(MY_TEAM - MY_TEAM_CLUB + MY_TEAM_ROWS * MY_TEAM_ROW)).step_by(4) {
+            if self.is_my_team(at) && found.replace(at - MY_TEAM_CLUB).is_some() {
+                return None;
+            }
+        }
+        match found {
+            Some(middle_shift) => Some(Layout { team_cap, middle_shift }),
+            // No list to measure by: only a save without grown arrays is known.
+            None => (team_cap == PLAIN_TEAMS).then_some(Layout::PLAIN),
+        }
+    }
+
+    /// A "My Team" list at `at`: a club's reference, then 64 rows
+    /// `(internal id, player id, 0, 0xC0…0xC7)` holding some of that club's squad.
+    fn is_my_team(&self, at: usize) -> bool {
+        let club_ref = u32_at(&self.data, at);
+        let club = (club_ref & 0x3FFF) as usize;
+        if club >= self.teams.len() || self.club_ref(club) != club_ref {
+            return false;
+        }
+        let rows: Vec<[u32; 4]> = (0..MY_TEAM_ROWS)
+            .map(|k| {
+                let o = at + (MY_TEAM - MY_TEAM_CLUB) + k * MY_TEAM_ROW;
+                core::array::from_fn(|w| u32_at(&self.data, o + 4 * w))
+            })
+            .collect();
+        if rows.iter().any(|r| r[2] != 0 || !(0xC0..=MY_TEAM_FREE).contains(&r[3])) {
+            return false;
+        }
+        let squad = self.club_roster(club);
+        rows.iter().any(|r| r[3] != MY_TEAM_FREE && squad.contains(&Player { internal_id: r[0], player_id: r[1] }))
+    }
+
     /// Finance block offset for this game, verified structurally; error text when untrusted.
     fn locate_finances(&self) -> Result<usize, String> {
+        let not_found = || "Couldn't find the budget in this save, so it can't be edited.".to_string();
         // No cross-variant fallback: the other game's offset can hold a look-alike block.
-        let off = if self.game.contains("Football Life") { FL26_FINANCE } else { PES21_FINANCE };
+        let plain = if self.game.contains("Football Life") { FL26_FINANCE } else { PES21_FINANCE };
+        let off = self.layout.ok_or_else(not_found)?.upper(plain);
         let plausible = self.data.len() >= off + SALARY_BUDGET_OFFSET + 4
             && (4..SEASON_START_BUDGET_OFFSET).step_by(4).all(|gap| u32_at(&self.data, off + gap) == 0)
             && u32_at(&self.data, off) < 0x8000_0000
             && (1..0x8000_0000).contains(&u32_at(&self.data, off + SALARY_BUDGET_OFFSET));
-        if plausible { Ok(off) } else { Err("Couldn't find the budget in this save, so it can't be edited.".into()) }
+        if plausible { Ok(off) } else { Err(not_found()) }
     }
 
     /// The user's manager: the coach whose handle the "My Team" club's record
@@ -462,11 +576,13 @@ impl MasterLeague {
     /// name field. Offsets of the name fields, the coach record's first; error text otherwise.
     fn locate_manager(&self) -> Result<Vec<usize>, String> {
         let not_found = || "Couldn't find the manager name in this save, so it can't be edited.".to_string();
+        let layout = self.layout.ok_or_else(not_found)?;
         let d = &self.data;
-        if d.len() < MY_TEAM_CLUB + 4 {
+        let my_team_club = layout.middle(MY_TEAM_CLUB);
+        if d.len() < my_team_club + 4 {
             return Err(not_found());
         }
-        let club_ref = u32_at(d, MY_TEAM_CLUB);
+        let club_ref = u32_at(d, my_team_club);
         let club = (club_ref & 0x3FFF) as usize;
         if club >= self.teams.len() || self.club_ref(club) != club_ref {
             return Err(not_found());
@@ -474,15 +590,11 @@ impl MasterLeague {
         let handle = &d[Self::base(club) + TEAM_COACH..][..8];
         let record = (u32_at(handle, 0) as usize)
             .checked_mul(COACH_RECORD)
-            .and_then(|o| o.checked_add(COACH_TABLE))
+            .and_then(|o| o.checked_add(layout.coaches()))
             .filter(|&o| o + COACH_RECORD <= d.len() && d[o..o + 8] == *handle)
             .ok_or_else(not_found)?;
         let field = &d[record + COACH_NAME..][..MANAGER_NAME_SIZE];
-        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-        let name_ok = std::str::from_utf8(&field[..end])
-            .is_ok_and(|n| !n.trim().is_empty() && !n.chars().any(|c| c < ' '))
-            && field[end..].iter().all(|&b| b == 0);
-        if !name_ok {
+        if !name_field_ok(field) {
             return Err(not_found());
         }
         let pattern = [&handle[4..], field].concat();
@@ -971,11 +1083,13 @@ impl MasterLeague {
     /// rows move up), as the list holds exactly the squad plus loans. Lists
     /// of another club, or without the player, are left alone.
     fn drop_from_my_team(&mut self, club: usize, player: &Player) {
-        let Some(end) = MY_TEAM.checked_add(MY_TEAM_ROWS * MY_TEAM_ROW).filter(|e| *e <= self.data.len()) else { return };
-        if u32_at(&self.data, MY_TEAM_CLUB) != u32_at(&self.data, Self::base(club)) {
+        let Some(layout) = self.layout else { return };
+        let (club_at, first) = (layout.middle(MY_TEAM_CLUB), layout.middle(MY_TEAM));
+        let Some(end) = first.checked_add(MY_TEAM_ROWS * MY_TEAM_ROW).filter(|e| *e <= self.data.len()) else { return };
+        if u32_at(&self.data, club_at) != u32_at(&self.data, Self::base(club)) {
             return;
         }
-        let row = |k: usize| MY_TEAM + k * MY_TEAM_ROW;
+        let row = |k: usize| first + k * MY_TEAM_ROW;
         let used = (0..MY_TEAM_ROWS).take_while(|&k| u32_at(&self.data, row(k) + 12) & 0xFF != MY_TEAM_FREE).count();
         let found = (0..used).find(|&k| {
             u32_at(&self.data, row(k)) == player.internal_id && u32_at(&self.data, row(k) + 4) == player.player_id
@@ -1236,7 +1350,7 @@ impl MasterLeague {
                 // or (when asked to wait) when the next transfer window opens.
                 // Saves whose transfer lists aren't recognised join right away,
                 // and refuse a closed window when asked to wait.
-                match DealTables::locate(&g.data, &table) {
+                match DealTables::locate(&g.data, &table, g.layout) {
                     Ok(tables) => {
                         let arrival = deals::arrival_date(today, req.wait_for_window);
                         let deal = AgreedDeal {
@@ -1319,7 +1433,7 @@ impl MasterLeague {
 
     /// Refuses a player the game already has an agreed deal for (a sale or loan waiting for its arrival date).
     fn refuse_agreed_deal(&self, table: &ContractTable, player: &Player) -> Result<(), Error> {
-        match DealTables::locate(&self.data, table) {
+        match DealTables::locate(&self.data, table, self.layout) {
             Ok(tables) if tables.has_agreed_offer(&self.data, player) => Err(Error::new(format!(
                 "Player ID {} already has an agreed deal (for example a loan) that the game completes on its arrival date.",
                 player.player_id
@@ -1371,7 +1485,7 @@ impl MasterLeague {
                 player.player_id
             )));
         }
-        let tables = DealTables::locate(&self.data, &table)?;
+        let tables = DealTables::locate(&self.data, &table, self.layout)?;
         let club_ref = |i: usize| if i == mine { table.team_ref } else { u32_at(&self.data, Self::base(i)) };
         let arrival = deals::arrival_date(today, req.wait_for_window);
         let deal = LoanDeal {
@@ -1398,7 +1512,7 @@ impl MasterLeague {
                 g.adjust_transfer_budget(if req.outgoing { req.fee_eur } else { -req.fee_eur })?;
                 parts.push(format!("fee {} {}", if req.outgoing { "received" } else { "paid" }, fmt_eur(req.fee_eur)));
             }
-            if !DealTables::locate(&g.data, &table)?.has_agreed_offer(&g.data, &player) {
+            if !DealTables::locate(&g.data, &table, g.layout)?.has_agreed_offer(&g.data, &player) {
                 return Err(Error::new("Final check failed: the agreed loan can't be read."));
             }
             Ok(parts.join("; "))

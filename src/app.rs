@@ -350,8 +350,11 @@ fn search_combo<T: Copy + PartialEq>(
         .show_ui(ui, |ui| {
             ui.add(egui::TextEdit::singleline(filter).hint_text("Search…").desired_width(width - 20.0)).request_focus();
             let q = normal(filter);
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for (label, value) in items.iter().filter(|(l, _)| q.is_empty() || normal(l).contains(&q)) {
+            // Only the visible rows are laid out: a Mod Studio world lists thousands of clubs.
+            let shown: Vec<&(String, T)> = items.iter().filter(|(l, _)| q.is_empty() || normal(l).contains(&q)).collect();
+            let row_height = ui.spacing().interact_size.y;
+            egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, shown.len(), |ui, rows| {
+                for (label, value) in &shown[rows] {
                     if ui.selectable_label(label == selected_text, label).clicked() {
                         picked = Some(*value);
                         ui.close();

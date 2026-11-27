@@ -44,8 +44,12 @@ pub const MANAGER_STATE: usize = 0xB7_F2F8;
 
 /// Every name field of the manager: its coach record, the second coach record, the state copy.
 pub fn manager_names() -> [usize; 3] {
-    let coach = |i: usize| ml::COACH_TABLE + i * ml::COACH_RECORD + ml::COACH_NAME;
-    [coach(MANAGER_COACH), coach(MANAGER_COACH + 1), MANAGER_STATE + ml::COACH_NAME]
+    manager_names_in(ml::Layout::PLAIN)
+}
+
+pub fn manager_names_in(layout: ml::Layout) -> [usize; 3] {
+    let coach = |i: usize| layout.coaches() + i * ml::COACH_RECORD + ml::COACH_NAME;
+    [coach(MANAGER_COACH), coach(MANAGER_COACH + 1), layout.middle(MANAGER_STATE) + ml::COACH_NAME]
 }
 
 /// Shirt number of squad slot `j`: clubs with an even index use 1..=20, odd ones 21..=40.
@@ -164,7 +168,12 @@ pub fn build_data(localized: bool) -> Vec<u8> {
 }
 
 pub fn build_data_with_records(localized: bool, records: &[u8]) -> Vec<u8> {
-    let mut data = vec![0u8; ml::FL26_FINANCE + 0x10000];
+    build_data_in(localized, records, ml::Layout::PLAIN)
+}
+
+/// The save with its fixed-offset tables where `layout` puts them (FL Mod Studio grows arrays and moves them).
+pub fn build_data_in(localized: bool, records: &[u8], layout: ml::Layout) -> Vec<u8> {
+    let mut data = vec![0u8; PLAYERS_AT];
     let national_names = ["Albania", "Andorra", "Armenia", "Austria"];
     let team = |data: &mut Vec<u8>, index: usize, name: &str, abbr: &str, players: &[ml::Player]| {
         let base = ml::TABLE_START + index * ml::RECORD_SIZE;
@@ -234,8 +243,8 @@ pub fn build_data_with_records(localized: bool, records: &[u8]) -> Vec<u8> {
     }
     for k in 0..8 {
         put(&mut data, FIRST_ROW + deals::AGREED_OFFSET + k * deals::AGREED_ENTRY, &[0xFF; 6]);
-        put_words(&mut data, deals::PENDING_ARRIVALS + k * deals::PENDING_ENTRY, &[0xFFFF, 0, 0]);
-        put_words(&mut data, deals::SEASON_DEALS + k * deals::DEAL_ENTRY, &[0xFFFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFFFF]);
+        put_words(&mut data, layout.upper(deals::PENDING_ARRIVALS) + k * deals::PENDING_ENTRY, &[0xFFFF, 0, 0]);
+        put_words(&mut data, layout.upper(deals::SEASON_DEALS) + k * deals::DEAL_ENTRY, &[0xFFFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFFFF]);
     }
     // Negotiation timeline: slot 0 (blocks 0..3) is an AI club's negotiation, then free slots.
     let blank_round = [0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0, 0];
@@ -255,12 +264,13 @@ pub fn build_data_with_records(localized: bool, records: &[u8]) -> Vec<u8> {
     // One news item already in the list, then free rows.
     let mut item = deals::BLANK_NEWS;
     (item[0], item[13]) = (0x1B, date(2025, 8, 1).pack());
-    put_words(&mut data, deals::NEWS, &item);
+    put_words(&mut data, layout.middle(deals::NEWS), &item);
     for k in 1..8 {
-        put_words(&mut data, deals::NEWS + k * deals::NEWS_ROW, &deals::BLANK_NEWS);
+        put_words(&mut data, layout.middle(deals::NEWS) + k * deals::NEWS_ROW, &deals::BLANK_NEWS);
     }
 
-    put_words(&mut data, ml::FL26_FINANCE, &[500_000, 0, 0, 0, 0, 200_000]); // €50M, €20M
+    put_words(&mut data, layout.upper(ml::FL26_FINANCE), &[500_000, 0, 0, 0, 0, 200_000]); // €50M, €20M
+    // Coach records 0–3 start the coach table, which tells the club table's capacity.
     // The managed club's manager in its coach records and the state copy, each
     // followed by a byte a rename must keep; another club's coach before them.
     let coach = |data: &mut Vec<u8>, at: usize, index: usize, id: u32, name: &str| {
@@ -268,24 +278,28 @@ pub fn build_data_with_records(localized: bool, records: &[u8]) -> Vec<u8> {
         put(data, at + ml::COACH_NAME, name.as_bytes());
         data[at + ml::COACH_NAME + ml::MANAGER_NAME_SIZE] = b'V';
     };
-    coach(&mut data, ml::COACH_TABLE + 659 * ml::COACH_RECORD, 659, 0x18B31, "Other Coach");
+    let coach_at = |index: usize| layout.coaches() + index * ml::COACH_RECORD;
+    for index in 0..4 {
+        coach(&mut data, coach_at(index), index, 0x1000 + index as u32, &format!("Coach {index}"));
+    }
+    coach(&mut data, coach_at(659), 659, 0x18B31, "Other Coach");
     for (at, index) in [
-        (ml::COACH_TABLE + MANAGER_COACH * ml::COACH_RECORD, MANAGER_COACH),
-        (ml::COACH_TABLE + (MANAGER_COACH + 1) * ml::COACH_RECORD, MANAGER_COACH + 1),
-        (MANAGER_STATE, MANAGER_COACH),
+        (coach_at(MANAGER_COACH), MANAGER_COACH),
+        (coach_at(MANAGER_COACH + 1), MANAGER_COACH + 1),
+        (layout.middle(MANAGER_STATE), MANAGER_COACH),
     ] {
         coach(&mut data, at, index, MANAGER_ID, "Test Manager");
     }
     put_words(&mut data, ml::TABLE_START + MANAGED * ml::RECORD_SIZE + ml::TEAM_COACH, &[MANAGER_COACH as u32, MANAGER_ID]);
 
     // "My Team": the managed squad in its own order (reversed), then free rows.
-    put_words(&mut data, ml::MY_TEAM_CLUB, &[team_ref(MANAGED)]);
+    put_words(&mut data, layout.middle(ml::MY_TEAM_CLUB), &[team_ref(MANAGED)]);
     for k in 0..64 {
         let row = match SQUAD.checked_sub(k + 1) {
             Some(j) => [club_player(MANAGED, j).internal_id, club_player(MANAGED, j).player_id, 0, 0xC0],
             None => [0xFFFF, 0, 0, 0xC7],
         };
-        put_words(&mut data, ml::MY_TEAM + k * ml::MY_TEAM_ROW, &row);
+        put_words(&mut data, layout.middle(ml::MY_TEAM) + k * ml::MY_TEAM_ROW, &row);
     }
 
     // Player records, then other data the container must not disturb.

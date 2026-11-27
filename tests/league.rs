@@ -36,12 +36,17 @@ fn table_before() -> [[u32; 5]; 4] {
 }
 
 fn league_save(dir: &TempDir, table: [[u32; 5]; 4]) -> MasterLeague {
+    league_save_from(dir, table, 0)
+}
+
+/// The fixtures numbered from `first` (GigaPack saves start at 65,536 and leave the slots before empty).
+fn league_save_from(dir: &TempDir, table: [[u32; 5]; 4], first: u32) -> MasterLeague {
     let mut data = build_data(false);
     for (k, (home, away, round, score)) in FIXTURES.iter().enumerate() {
         let state = if score.is_some() { 6 } else { 2 };
         let (h, a) = score.unwrap_or((0, 0));
         let when = date(2025, 8, 1 + 7 * *round as u8).pack();
-        let words = [k as u32, state << 28 | round << 16 | COMPETITION, when, 0, 0x0F, team_ref(*home), team_ref(*away), h as u32 | (a as u32) << 24];
+        let words = [first + k as u32, state << 28 | round << 16 | COMPETITION, when, 0, 0x0F, team_ref(*home), team_ref(*away), h as u32 | (a as u32) << 24];
         put_words(&mut data, MATCHES_AT + k * MATCH_RECORD, &words);
     }
     put_words(&mut data, LEAGUE_AT, &[2025 << 16 | COMPETITION, COMPETITION, 1, 1, 0xFFFF]);
@@ -123,4 +128,14 @@ fn table_that_does_not_add_up_is_left_alone() {
     assert!(game.set_league_win(AWAY_LOSS, 4, 3).is_err());
     assert!(game.history.is_empty());
     assert_eq!(game.data, before);
+}
+
+#[test]
+fn matches_numbered_from_a_later_index_are_found() {
+    let dir = TempDir::new("league_later");
+    let mut game = league_save_from(&dir, table_before(), 1000);
+    let view = game.league().unwrap();
+    assert_eq!(view.fixtures.iter().map(|f| f.index).collect::<Vec<_>>(), [1000, 1002, 1004]);
+    game.set_league_win(1000 + AWAY_LOSS, 4, 3).unwrap();
+    assert_eq!(score_word(&game, AWAY_LOSS), 3 | 4 << 24);
 }

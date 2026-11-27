@@ -12,7 +12,7 @@
 //! | w3   | contract start date, or 0xFFFF |
 //! | w4, w5 | 0xFFFFFFFF |
 //! | w6   | low 16 bits 0xFFFF |
-//! | w7   | internal id (same as in the club roster pair) |
+//! | w7   | internal id (same as in the club roster pair); low 16 bits 0xFFFF for players past the first 65,535 (FL Mod Studio worlds) |
 //! | w8   | player id |
 //! | w9   | annual salary, units of 100 EUR |
 //! | w10  | player value at signing, units of 100 EUR (equals the fee for some signings) |
@@ -157,8 +157,9 @@ pub fn is_record(t: Option<Words>) -> bool {
     let Some(t) = t else { return false };
     let end_ok = Date::unpack(t[W_END]).is_some_and(|d| (2000..=2150).contains(&d.year));
     let index = t[W_INDEX] & 0xFFFF;
-    t[W_INTERNAL] & 0xFFFF != 0xFFFF
-        && t[W_PLAYER] != 0
+    // No check on the internal id: in Mod Studio worlds players past the
+    // first 65,535 have 0xFFFF there; blank rows have no player id.
+    t[W_PLAYER] != 0
         && 0 < t[W_SALARY]
         && t[W_SALARY] < 10_000_000
         && end_ok
