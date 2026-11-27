@@ -17,8 +17,13 @@
 //!   (found there in a real save, value not checked in game); PES 2021 at
 //!   0xC7DE00 (ML Money Tool by Devil Cold52). The game shows the salary budget
 //!   minus the club's wage bill, and charges the transfer fee when a deal is
-//!   agreed. Manager name: UTF-8 at 0x1942C0, 46 bytes; read and edited
-//!   separately from the budget, so one being unreadable doesn't lock the other.
+//!   agreed. Read and edited separately from the manager name, so one being
+//!   unreadable doesn't lock the other.
+//! * Coaches at 0x133A30, 0x258 bytes each: u32 index, u32 coach id, name
+//!   (UTF-8, 46 bytes). A club record holds its manager's handle (index, id) at
+//!   +0x28C. The user's manager is the coach of the club "My Team" refers to;
+//!   the game keeps the same id and name in two more places (a second coach
+//!   record and a copy in the career state), and a rename writes all of them.
 //! * "My Team" list of the managed club at 0xB7F8BC: 16-byte rows
 //!   `(internal id, player id, 0, flag)`, flag 0xC0 in the squad, 0xC1 just
 //!   arrived, 0xC2 on loan, 0xC7 free; club reference at 0xB7F804.
@@ -62,8 +67,13 @@ pub const PES21_FINANCE: usize = 0xC7DE00;
 pub const SALARY_BUDGET_OFFSET: usize = 0x14;
 /// Transfer budget at the start of the season; 0 during the first season.
 const SEASON_START_BUDGET_OFFSET: usize = 0x10;
-pub const MANAGER_NAME: usize = 0x1942C0;
+pub const COACH_TABLE: usize = 0x13_3A30;
+pub const COACH_RECORD: usize = 0x258;
+/// Coach record: u32 index, u32 coach id, then the name.
+pub const COACH_NAME: usize = 8;
 pub const MANAGER_NAME_SIZE: usize = 46;
+/// Club record: handle (u32 coach index, u32 coach id) of the club's manager.
+pub const TEAM_COACH: usize = 0x28C;
 pub const MY_TEAM_CLUB: usize = 0xB7_F804;
 pub const MY_TEAM: usize = 0xB7_F8BC;
 pub const MY_TEAM_ROW: usize = 16;
@@ -259,6 +269,8 @@ pub struct MasterLeague {
     pub finance_error: Option<String>,
     /// Why the manager name can't be edited; `None` when it can.
     pub manager_error: Option<String>,
+    /// Every copy of the manager's name field, the coach record first.
+    manager_names: Vec<usize>,
     /// In-game date from the save description.
     pub game_date: Option<Date>,
     /// Managed club named in the save description.
@@ -306,6 +318,7 @@ impl MasterLeague {
             finance_offset: None,
             finance_error: None,
             manager_error: None,
+            manager_names: Vec::new(),
             game_date: None,
             described_club: None,
             league_name: None,
@@ -323,7 +336,10 @@ impl MasterLeague {
             Ok(offset) => game.finance_offset = Some(offset),
             Err(e) => game.finance_error = Some(e),
         }
-        game.manager_error = game.check_manager_name().err();
+        match game.locate_manager() {
+            Ok(offsets) => game.manager_names = offsets,
+            Err(e) => game.manager_error = Some(e),
+        }
         game.read_description();
         game.load_players();
         Ok(game)
@@ -441,18 +457,38 @@ impl MasterLeague {
         if plausible { Ok(off) } else { Err("Couldn't find the budget in this save, so it can't be edited.".into()) }
     }
 
-    /// The manager name field holds one NUL-padded line of UTF-8; error text otherwise.
-    fn check_manager_name(&self) -> Result<(), String> {
-        let raw = self.data.get(MANAGER_NAME..MANAGER_NAME + MANAGER_NAME_SIZE).unwrap_or(&[]);
-        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        let name_ok = std::str::from_utf8(&raw[..end])
-            .is_ok_and(|n| !n.trim().is_empty() && !n.chars().any(|c| c < ' '))
-            && raw[end..].iter().all(|&b| b == 0);
-        if !raw.is_empty() && name_ok {
-            Ok(())
-        } else {
-            Err("Couldn't find the manager name in this save, so it can't be edited.".into())
+    /// The user's manager: the coach whose handle the "My Team" club's record
+    /// holds, plus every other copy of that coach's id followed by the same
+    /// name field. Offsets of the name fields, the coach record's first; error text otherwise.
+    fn locate_manager(&self) -> Result<Vec<usize>, String> {
+        let not_found = || "Couldn't find the manager name in this save, so it can't be edited.".to_string();
+        let d = &self.data;
+        if d.len() < MY_TEAM_CLUB + 4 {
+            return Err(not_found());
         }
+        let club_ref = u32_at(d, MY_TEAM_CLUB);
+        let club = (club_ref & 0x3FFF) as usize;
+        if club >= self.teams.len() || self.club_ref(club) != club_ref {
+            return Err(not_found());
+        }
+        let handle = &d[Self::base(club) + TEAM_COACH..][..8];
+        let record = (u32_at(handle, 0) as usize)
+            .checked_mul(COACH_RECORD)
+            .and_then(|o| o.checked_add(COACH_TABLE))
+            .filter(|&o| o + COACH_RECORD <= d.len() && d[o..o + 8] == *handle)
+            .ok_or_else(not_found)?;
+        let field = &d[record + COACH_NAME..][..MANAGER_NAME_SIZE];
+        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+        let name_ok = std::str::from_utf8(&field[..end])
+            .is_ok_and(|n| !n.trim().is_empty() && !n.chars().any(|c| c < ' '))
+            && field[end..].iter().all(|&b| b == 0);
+        if !name_ok {
+            return Err(not_found());
+        }
+        let pattern = [&handle[4..], field].concat();
+        let mut offsets = vec![record + COACH_NAME];
+        offsets.extend(memchr::memmem::find_iter(d, &pattern).map(|o| o + 4).filter(|&o| o != record + COACH_NAME));
+        Ok(offsets)
     }
 
     // --- rosters ---------------------------------------------------------
@@ -1015,7 +1051,7 @@ impl MasterLeague {
     pub fn manager_name(&self) -> Result<String, Error> {
         match &self.manager_error {
             Some(e) => Err(Error::new(e.clone())),
-            None => Ok(text_at(&self.data, MANAGER_NAME, MANAGER_NAME_SIZE)),
+            None => Ok(text_at(&self.data, self.manager_names[0], MANAGER_NAME_SIZE)),
         }
     }
 
@@ -1038,7 +1074,9 @@ impl MasterLeague {
         self.atomic(Redo::Manager(name.clone()), move |g| {
             let mut bytes = name.as_bytes().to_vec();
             bytes.resize(MANAGER_NAME_SIZE, 0);
-            g.patch(MANAGER_NAME, &bytes);
+            for offset in g.manager_names.clone() {
+                g.patch(offset, &bytes);
+            }
             Ok(format!("Manager: \"{before}\" → \"{name}\""))
         })
     }

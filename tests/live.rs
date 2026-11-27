@@ -18,8 +18,8 @@ const HEAP: u64 = 0x5_0000_0000;
 const STATION: u64 = 0x6_0000_0000;
 const RECORD: u64 = 0x17C;
 const OFF_DATE: u64 = 0x164_2A24;
-/// Part of the save the fake game keeps byte for byte: club table to finance block.
-const COPIED: std::ops::Range<usize> = ml::MANAGER_NAME - 0x1000..ml::FL26_FINANCE + 0x4000;
+/// Part of the save the fake game keeps byte for byte: coach table to finance block.
+const COPIED: std::ops::Range<usize> = ml::COACH_TABLE..ml::FL26_FINANCE + 0x4000;
 /// The player's club as the game's record holds it.
 const GAME_CLUB: u32 = 0x1234;
 const RENEWED: usize = 2;
@@ -294,7 +294,9 @@ fn release_clause_and_manager_name_reach_the_running_game() {
 
     assert_eq!(game.u32(terms_at(RENEWED) + 0x10), 400_000);
     assert_eq!(game.u32(record_at(RENEWED) + 0x144), 0x4000_0101, "has a release clause");
-    assert_eq!(&game.bytes(saved(ml::MANAGER_NAME), 9), b"New Boss\0");
+    for at in manager_names() {
+        assert_eq!(&game.bytes(saved(at), 9), b"New Boss\0");
+    }
 
     // Removing it again.
     save.renew_contract(player, salary as i64 * 100, end, Some(0), None).unwrap();

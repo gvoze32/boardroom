@@ -705,14 +705,19 @@ fn free_agent_deal_has_no_offer_and_no_fee() {
 }
 
 #[test]
-fn manager_rename_keeps_neighbouring_byte() {
+fn manager_rename_writes_every_copy_and_keeps_neighbouring_bytes() {
     let dir = TempDir::new("rename");
     let mut game = open(&dir);
     let budget = game.finances().unwrap();
     game.set_manager_name("New Coach").unwrap();
     assert_eq!(game.manager_name().unwrap(), "New Coach");
     assert_eq!(game.finances().unwrap(), budget);
-    assert_eq!(game.data[ml::MANAGER_NAME + ml::MANAGER_NAME_SIZE], b'V');
+    for at in manager_names() {
+        assert_eq!(&game.data[at..at + 10], b"New Coach\0");
+        assert_eq!(game.data[at + ml::MANAGER_NAME_SIZE], b'V');
+    }
+    let other = ml::COACH_TABLE + 659 * ml::COACH_RECORD + ml::COACH_NAME;
+    assert_eq!(&game.data[other..other + 11], b"Other Coach");
     assert!(game.set_manager_name(&"x".repeat(46)).is_err());
 }
 
@@ -720,7 +725,8 @@ fn manager_rename_keeps_neighbouring_byte() {
 fn manager_name_and_budget_are_independent() {
     let dir = TempDir::new("independent");
     let mut data = build_data(false);
-    data[ml::MANAGER_NAME..ml::MANAGER_NAME + ml::MANAGER_NAME_SIZE].fill(0);
+    let [at, ..] = manager_names();
+    data[at..at + ml::MANAGER_NAME_SIZE].fill(0);
     let mut game = open_with(&dir, data);
     assert!(game.manager_error.is_some() && game.manager_name().is_err());
     game.set_finances(60_000_000, 20_000_000).unwrap();

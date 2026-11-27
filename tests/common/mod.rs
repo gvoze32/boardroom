@@ -36,6 +36,17 @@ pub const RECORDED_CLUBS: usize = 64;
 pub const TAIL: [u8; 8] = *b"TAILDATA";
 /// Competition registrations of every club player.
 pub const COMPETITIONS: [u32; 4] = [0x0340_0011, 0x0280_0017, 0xFFFF, 0xFFFF];
+/// The user's manager: coach record index and id (the game gives the user's coach 0xFFFFFFF5).
+pub const MANAGER_COACH: usize = 730;
+pub const MANAGER_ID: u32 = 0xFFFF_FFF5;
+/// The career state's copy of the manager's coach record.
+pub const MANAGER_STATE: usize = 0xB7_F2F8;
+
+/// Every name field of the manager: its coach record, the second coach record, the state copy.
+pub fn manager_names() -> [usize; 3] {
+    let coach = |i: usize| ml::COACH_TABLE + i * ml::COACH_RECORD + ml::COACH_NAME;
+    [coach(MANAGER_COACH), coach(MANAGER_COACH + 1), MANAGER_STATE + ml::COACH_NAME]
+}
 
 /// Shirt number of squad slot `j`: clubs with an even index use 1..=20, odd ones 21..=40.
 pub fn shirt(club: usize, j: usize) -> u16 {
@@ -250,8 +261,22 @@ pub fn build_data_with_records(localized: bool, records: &[u8]) -> Vec<u8> {
     }
 
     put_words(&mut data, ml::FL26_FINANCE, &[500_000, 0, 0, 0, 0, 200_000]); // €50M, €20M
-    put(&mut data, ml::MANAGER_NAME, b"Test Manager");
-    data[ml::MANAGER_NAME + ml::MANAGER_NAME_SIZE] = b'V';
+    // The managed club's manager in its coach records and the state copy, each
+    // followed by a byte a rename must keep; another club's coach before them.
+    let coach = |data: &mut Vec<u8>, at: usize, index: usize, id: u32, name: &str| {
+        put_words(data, at, &[index as u32, id]);
+        put(data, at + ml::COACH_NAME, name.as_bytes());
+        data[at + ml::COACH_NAME + ml::MANAGER_NAME_SIZE] = b'V';
+    };
+    coach(&mut data, ml::COACH_TABLE + 659 * ml::COACH_RECORD, 659, 0x18B31, "Other Coach");
+    for (at, index) in [
+        (ml::COACH_TABLE + MANAGER_COACH * ml::COACH_RECORD, MANAGER_COACH),
+        (ml::COACH_TABLE + (MANAGER_COACH + 1) * ml::COACH_RECORD, MANAGER_COACH + 1),
+        (MANAGER_STATE, MANAGER_COACH),
+    ] {
+        coach(&mut data, at, index, MANAGER_ID, "Test Manager");
+    }
+    put_words(&mut data, ml::TABLE_START + MANAGED * ml::RECORD_SIZE + ml::TEAM_COACH, &[MANAGER_COACH as u32, MANAGER_ID]);
 
     // "My Team": the managed squad in its own order (reversed), then free rows.
     put_words(&mut data, ml::MY_TEAM_CLUB, &[team_ref(MANAGED)]);
