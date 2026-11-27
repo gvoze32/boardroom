@@ -1,0 +1,3 @@
+# The running-game hook stub (C/assembly, built into src/live_stub.bin) is
+# kept out of GitHub's language stats.
+stub/** linguist-detectable=false
