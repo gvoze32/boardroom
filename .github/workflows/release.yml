@@ -108,6 +108,21 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           ls -l
 
+      # Release notes: this version's section of CHANGELOG.md (from its
+      # "## vX.Y.Z" heading to the next "## " heading).
+      - name: Release notes
+        run: |
+          awk -v v="## v${{ steps.meta.outputs.version }}" '
+            $0 == v { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ "${{ steps.meta.outputs.release }}" = "true" ] && ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "CHANGELOG.md has no section for v${{ steps.meta.outputs.version }}"
+            exit 1
+          fi
+          cat release-notes.md
+
       - uses: actions/upload-artifact@v4
         with:
           name: Boardroom-v${{ steps.meta.outputs.version }}
@@ -121,5 +136,6 @@ jobs:
           tag_name: v${{ steps.meta.outputs.version }}
           name: Boardroom v${{ steps.meta.outputs.version }}
           target_commitish: ${{ github.sha }}
+          body_path: release-notes.md
           generate_release_notes: true
           files: dist/*
