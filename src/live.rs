@@ -52,6 +52,9 @@ const OFF_TABLE: u64 = 0x48;
 const OFF_DATE: u64 = 0x164_2A24;
 /// Where FL Mod Studio worlds keep the date instead (player table + …).
 const DATE_SCAN: std::ops::Range<u64> = 0x150_0000..0x260_0000;
+/// Searched when `DATE_SCAN` has no single hit: GigaPack's player table
+/// (134,000 players, about 51 MB) pushes the date past it (The Gaffer, pc512p).
+const DATE_SCAN_FAR: std::ops::Range<u64> = DATE_SCAN.end..0x500_0000;
 const DATE_SCAN_CHUNK: usize = 0x4_0000;
 
 const RECORD: u64 = 0x17C;
@@ -332,9 +335,13 @@ fn date_at(raw: &[u8]) -> Option<Date> {
 /// The calendar block of FL Mod Studio worlds: season start, a small
 /// counter, the previous day and today, one word each.
 fn find_date(mem: &dyn Memory, table: u64) -> Option<u64> {
+    find_date_in(mem, table, DATE_SCAN).or_else(|| find_date_in(mem, table, DATE_SCAN_FAR))
+}
+
+fn find_date_in(mem: &dyn Memory, table: u64, range: std::ops::Range<u64>) -> Option<u64> {
     let mut hits = Vec::new();
-    let mut at = DATE_SCAN.start;
-    while at < DATE_SCAN.end {
+    let mut at = range.start;
+    while at < range.end {
         if let Some(buf) = read_vec(mem, table + at - 16, DATE_SCAN_CHUNK + 16) {
             for i in (16..buf.len() - 3).step_by(4) {
                 let (Some(today), Some(prev), Some(start)) =

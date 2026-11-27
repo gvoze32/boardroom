@@ -379,6 +379,82 @@ fn arrival_waits_for_the_next_transfer_window() {
 }
 
 #[test]
+fn transfer_budget_below_zero_is_read_signed() {
+    // The game took the budget to -€4,400 (compensation paid in the game).
+    let mut data = build_data(false);
+    put_words(&mut data, ml::FL26_FINANCE, &[(-44i32) as u32]);
+    let mut game = open_with(&TempDir::new("negative-budget"), data);
+    assert!(game.finance_error.is_none());
+    assert_eq!(game.finances().unwrap().transfer_eur, -4_400);
+    let before = game.data.clone();
+    let pid = club_player(7, 3).player_id;
+    let err = game.transfer(incoming(7, pid, 1_000_000, 1_000_000, date(2029, 8, 31))).unwrap_err();
+    assert!(err.to_string().contains("€1,000,000 short"), "{err}");
+    assert_eq!(game.data, before);
+    // A sale's fee is added to it.
+    let seller = club_player(MANAGED, 2).player_id;
+    game.transfer(TransferRequest { fee_eur: 2_000_000, ..TransferRequest::new(Source::Club(MANAGED), 8, seller) }).unwrap();
+    assert_eq!(game.finances().unwrap().transfer_eur, 1_995_600);
+    assert!(game.set_finances(-1, game.finances().unwrap().salary_eur).is_err(), "no negative budget typed in");
+}
+
+#[test]
+fn club_record_budget_copy_follows_only_when_it_matches() {
+    let copy = ml::TABLE_START + MANAGED * ml::RECORD_SIZE + 0x644;
+    // The game keeps the budget in your club's record too (after a deal accepted in the game).
+    let mut data = build_data(false);
+    put_words(&mut data, copy, &[500_000]);
+    let mut game = open_with(&TempDir::new("budget-copy"), data);
+    let salary = game.finances().unwrap().salary_eur;
+    game.set_finances(40_000_000, salary).unwrap();
+    assert_eq!((u32_at(&game.data, ml::FL26_FINANCE), u32_at(&game.data, copy)), (400_000, 400_000));
+    game.undo().unwrap();
+    assert_eq!(u32_at(&game.data, copy), 500_000, "undo restores the copy");
+    // A record value that isn't the budget is left alone.
+    let mut data = build_data(false);
+    put_words(&mut data, copy, &[13_428_000]);
+    let mut game = open_with(&TempDir::new("budget-no-copy"), data);
+    game.set_finances(40_000_000, salary).unwrap();
+    assert_eq!((u32_at(&game.data, ml::FL26_FINANCE), u32_at(&game.data, copy)), (400_000, 13_428_000));
+}
+
+/// A news list with all 200 rows used by game events dated `dates(row)`.
+fn full_news(dates: impl Fn(usize) -> boardroom::contracts::Date) -> Vec<u8> {
+    let mut data = build_data(false);
+    for k in 0..200 {
+        let mut item = deals::BLANK_NEWS;
+        (item[0], item[13]) = (0x1B, dates(k).pack());
+        put_words(&mut data, deals::NEWS + k * deals::NEWS_ROW, &item);
+    }
+    data
+}
+
+#[test]
+fn full_news_list_reuses_the_oldest_old_game_event() {
+    // Today is 6 Aug 2025; row 9 (1 Mar) is the oldest, row 4 (1 Jun) is old enough too.
+    let data = full_news(|k| match k {
+        9 => date(2025, 3, 1),
+        4 => date(2025, 6, 1),
+        _ => date(2025, 7, 20),
+    });
+    let mut game = open_with(&TempDir::new("news-full"), data);
+    let target = club_player(7, 2);
+    game.loan(loan(7, false, target.player_id, 0, date(2025, 12, 31))).unwrap();
+    let row = wordsn::<14>(&game.data, deals::NEWS + 9 * deals::NEWS_ROW);
+    assert_eq!((row[0], row[1], row[2], row[13]), (0x6E, target.internal_id, target.player_id, date(2025, 8, 6).pack()));
+    assert_eq!(wordsn::<14>(&game.data, deals::NEWS + 4 * deals::NEWS_ROW)[0], 0x1B);
+}
+
+#[test]
+fn full_news_list_of_recent_events_refuses_the_deal() {
+    let mut game = open_with(&TempDir::new("news-recent"), full_news(|_| date(2025, 7, 1)));
+    let before = game.data.clone();
+    let err = game.loan(loan(7, false, club_player(7, 2).player_id, 0, date(2025, 12, 31))).unwrap_err();
+    assert!(err.to_string().contains("news list is full"), "{err}");
+    assert_eq!(game.data, before);
+}
+
+#[test]
 fn insufficient_budget_leaves_save_untouched() {
     let dir = TempDir::new("insufficient");
     let mut game = open(&dir);
@@ -576,6 +652,35 @@ fn player_on_loan_is_not_moved() {
     assert!(game.transfer(TransferRequest::new(Source::Club(5), 7, p.player_id)).is_err());
     assert_eq!((game.data == data, game.records == recs), (true, true));
     assert!(game.operations().is_empty());
+}
+
+#[test]
+fn running_loans_show_both_ways() {
+    // Managed player 3 plays for club 7 on loan; club 7's player 5 plays for you.
+    let (out, inn) = (club_player(MANAGED, 3), club_player(7, 5));
+    let mut records = player_records();
+    for (p, from) in [(out, team_ref(MANAGED)), (inn, team_ref(7))] {
+        let o = record_at(p);
+        records[o + pdb::R_FLAGS] |= pdb::FLAG_LOAN;
+        put_words(&mut records, o + pdb::R_FROM_CLUB, &[from]);
+        put_words(&mut records, o + pdb::R_LOAN_END, &[date(2026, 6, 30).pack()]);
+    }
+    let mut data = build_data_with_records(false, &records);
+    let slot = |club: usize, j: usize| ml::TABLE_START + club * ml::RECORD_SIZE + ml::ROSTER_OFFSET + 8 * j;
+    put_words(&mut data, slot(MANAGED, 3), &[inn.internal_id, inn.player_id]);
+    put_words(&mut data, slot(7, 5), &[out.internal_id, out.player_id]);
+    let game = open_with(&TempDir::new("running-loans"), data);
+
+    let away = game.loaned_out();
+    assert_eq!(away.len(), 1);
+    assert_eq!((away[0].0, away[0].1.player_id, away[0].2), (out, out.player_id, Some(7)));
+    let squad = game.squad_contracts();
+    assert!(squad.iter().any(|(p, c)| *p == inn && c.is_none()));
+    assert!(!squad.iter().any(|(p, _)| *p == out));
+    let loan = game.loan_of(&inn).unwrap();
+    assert_eq!((loan.from, loan.until), (Some(7), Some(date(2026, 6, 30))));
+    assert_eq!(game.loan_of(&out).unwrap().until, Some(date(2026, 6, 30)));
+    assert_eq!(game.loan_of(&club_player(MANAGED, 4)), None);
 }
 
 #[test]

@@ -89,6 +89,14 @@ impl Date {
             .unwrap_or(Date { year: self.year + 1, month: 1, day: 1 })
     }
 
+    /// Days since 1 March of year 0 (proleptic Gregorian); differences are exact.
+    pub fn day_number(self) -> i64 {
+        let (m, d) = (self.month as i64, self.day as i64);
+        let y = self.year as i64 - i64::from(m < 3);
+        let mp = (m + 9) % 12;
+        365 * y + y / 4 - y / 100 + y / 400 + (153 * mp + 2) / 5 + d - 1
+    }
+
     /// Whole months from `self` to `later`; 0 when `later` is not after `self`.
     pub fn months_until(self, later: Date) -> u32 {
         let months = (later.year as i32 - self.year as i32) * 12 + later.month as i32 - self.month as i32

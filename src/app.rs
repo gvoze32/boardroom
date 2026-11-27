@@ -246,11 +246,51 @@ fn budget_field(text: &mut String) -> egui::TextEdit<'_> {
         .min_size(egui::vec2(320.0, 0.0))
 }
 
+/// Where a squad-tab player is: in your squad, or on loan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Whereabouts {
+    Squad,
+    /// In your squad on loan; his contract is with `from`.
+    LoanedIn { from: Option<usize>, until: Option<Date> },
+    /// Under contract with you, playing for `at` on loan.
+    LoanedOut { at: Option<usize>, until: Option<Date> },
+}
+
+/// Which rows the squad table shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SquadView {
+    All,
+    Squad,
+    LoanedIn,
+    LoanedOut,
+}
+
+impl SquadView {
+    const ALL: [(SquadView, &'static str); 4] = [
+        (SquadView::All, "Everyone"),
+        (SquadView::Squad, "In the squad"),
+        (SquadView::LoanedIn, "Loaned in"),
+        (SquadView::LoanedOut, "Loaned out"),
+    ];
+
+    fn shows(self, w: Whereabouts) -> bool {
+        match self {
+            SquadView::All => true,
+            SquadView::Squad => !matches!(w, Whereabouts::LoanedOut { .. }),
+            SquadView::LoanedIn => matches!(w, Whereabouts::LoanedIn { .. }),
+            SquadView::LoanedOut => matches!(w, Whereabouts::LoanedOut { .. }),
+        }
+    }
+}
+
 struct SquadRow {
     player: Player,
     info: PlayerInfo,
     contract: Option<Contract>,
     months_left: Option<u32>,
+    whereabouts: Whereabouts,
+    /// Status column text, e.g. "Loaned out to Club 7 until 30-06-2026".
+    status: String,
 }
 
 #[derive(Clone)]
@@ -424,6 +464,8 @@ pub struct App {
     squad: Vec<SquadRow>,
     squad_selected: Option<Player>,
     expiring_only: bool,
+    squad_query: String,
+    squad_view: SquadView,
     renew_salary: String,
     renew_end: (u16, u8, u8),
     /// Release clause of the renewed contract; empty = none.
@@ -502,6 +544,8 @@ impl App {
             squad: Vec::new(),
             squad_selected: None,
             expiring_only: false,
+            squad_query: String::new(),
+            squad_view: SquadView::All,
             renew_salary: String::new(),
             renew_end: (2029, 6, 30),
             renew_release: String::new(),
@@ -867,22 +911,44 @@ impl App {
         self.results = rows;
     }
 
-    /// Your club's players with their contracts, the soonest-ending first.
+    /// Your club's players with their contracts, the soonest-ending first,
+    /// then the players you loaned out.
     fn refresh_squad(&mut self) {
         self.squad.clear();
         let Some(game) = &self.game else { return };
         let today = game.game_date;
-        let mut rows: Vec<SquadRow> = game
-            .squad_contracts()
-            .into_iter()
-            .map(|(player, contract)| SquadRow {
+        let club_name = |i: Option<usize>| i.map_or_else(|| "another club".to_string(), |i| game.teams[i].name.clone());
+        let until = |d: Option<Date>| d.map_or(String::new(), |d| format!(" until {d}"));
+        let in_squad = game.squad_contracts().into_iter().map(|(player, contract)| {
+            let whereabouts = match game.loan_of(&player) {
+                Some(l) if contract.is_none() => Whereabouts::LoanedIn { from: l.from, until: l.until },
+                _ => Whereabouts::Squad,
+            };
+            (player, contract, whereabouts)
+        });
+        let away = game.loaned_out().into_iter().map(|(player, contract, at)| {
+            let until = game.loan_of(&player).and_then(|l| l.until);
+            (player, Some(contract), Whereabouts::LoanedOut { at, until })
+        });
+        let mut rows: Vec<SquadRow> = in_squad
+            .chain(away)
+            .map(|(player, contract, whereabouts)| SquadRow {
                 player,
                 info: self.catalog.get(player.player_id),
                 months_left: today.zip(contract).map(|(t, c)| t.months_until(c.end)),
                 contract,
+                whereabouts,
+                status: match whereabouts {
+                    Whereabouts::Squad => String::new(),
+                    Whereabouts::LoanedIn { from, until: u } => format!("Loaned in from {}{}", club_name(from), until(u)),
+                    Whereabouts::LoanedOut { at, until: u } => format!("Loaned out to {}{}", club_name(at), until(u)),
+                },
             })
             .collect();
-        rows.sort_by_cached_key(|r| (r.contract.map_or(Date { year: u16::MAX, month: 12, day: 31 }, |c| c.end), normal(&r.info.name)));
+        rows.sort_by_cached_key(|r| {
+            let away = matches!(r.whereabouts, Whereabouts::LoanedOut { .. });
+            (away, r.contract.map_or(Date { year: u16::MAX, month: 12, day: 31 }, |c| c.end), normal(&r.info.name))
+        });
         if let Some(p) = self.squad_selected
             && !rows.iter().any(|r| r.player == p)
         {
@@ -984,8 +1050,18 @@ impl App {
     }
 
     fn export_squad(&mut self) {
-        let header =
-            ["Player", "Position", "Age", "OVR", "Salary per year (EUR)", "Contract start", "Contract until", "Months left", "Player ID"];
+        let header = [
+            "Player",
+            "Position",
+            "Age",
+            "OVR",
+            "Salary per year (EUR)",
+            "Contract start",
+            "Contract until",
+            "Months left",
+            "Loan",
+            "Player ID",
+        ];
         let mut rows = vec![header.map(String::from).to_vec()];
         rows.extend(self.squad.iter().map(|r| {
             vec![
@@ -997,6 +1073,7 @@ impl App {
                 opt(r.contract.and_then(|c| c.start).map(iso)),
                 opt(r.contract.map(|c| iso(c.end))),
                 opt(r.months_left),
+                r.status.clone(),
                 r.player.player_id.to_string(),
             ]
         }));
@@ -1979,9 +2056,18 @@ impl App {
         let left = game.finances().ok().map(|f| f.salary_eur - committed);
         let date = game.game_date;
         let expiring = self.squad.iter().filter(|r| Self::is_expiring(r)).count();
+        let count = |pick: fn(&Whereabouts) -> bool| self.squad.iter().filter(|r| pick(&r.whereabouts)).count();
+        let loaned_in = count(|w| matches!(w, Whereabouts::LoanedIn { .. }));
+        let loaned_out = count(|w| matches!(w, Whereabouts::LoanedOut { .. }));
         let muted = theme::muted(ui);
         ui.horizontal_wrapped(|ui| {
-            ui.strong(format!("{club} · {}/40 players", self.squad.len()));
+            ui.strong(format!("{club} · {}/40 players", self.squad.len() - loaned_out));
+            if loaned_in > 0 {
+                ui.label(format!("{loaned_in} loaned in"));
+            }
+            if loaned_out > 0 {
+                ui.label(format!("{loaned_out} loaned out"));
+            }
             ui.label(format!("Wages: {}/yr", self.to_display(wages)));
             if committed != wages {
                 ui.label(format!("Agreed signings: +{}/yr", self.to_display(committed - wages)));
@@ -1994,6 +2080,16 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label("Search (name/ID):");
+            ui.add(egui::TextEdit::singleline(&mut self.squad_query).desired_width(200.0));
+            ui.label("Show:");
+            let current = SquadView::ALL.iter().find(|(v, _)| *v == self.squad_view).map_or("", |(_, l)| *l);
+            egui::ComboBox::from_id_salt("squad_view").selected_text(current).show_ui(ui, |ui| {
+                for (view, label) in SquadView::ALL {
+                    ui.selectable_value(&mut self.squad_view, view, label);
+                }
+            });
+            ui.add_space(8.0);
             let tone = if expiring > 0 { Tone::Warn } else { Tone::Ok };
             theme::chip(ui, tone, format!("{expiring} contracts end within {EXPIRING_MONTHS} months"));
             ui.checkbox(&mut self.expiring_only, "Show only these");
@@ -2012,8 +2108,15 @@ impl App {
 
     fn squad_table(&mut self, ui: &mut egui::Ui) {
         let warn = theme::tone_color(ui, Tone::Warn);
-        let shown: Vec<usize> =
-            (0..self.squad.len()).filter(|&i| !self.expiring_only || Self::is_expiring(&self.squad[i])).collect();
+        let q = normal(self.squad_query.trim());
+        let shown: Vec<usize> = (0..self.squad.len())
+            .filter(|&i| {
+                let r = &self.squad[i];
+                (!self.expiring_only || Self::is_expiring(r))
+                    && self.squad_view.shows(r.whereabouts)
+                    && (q.is_empty() || normal(&format!("{} {}", r.info.name, r.player.player_id)).contains(&q))
+            })
+            .collect();
         let mut clicked = None;
         TableBuilder::new(ui)
             .id_salt("squad")
@@ -2029,9 +2132,12 @@ impl App {
             .column(Column::initial(110.0))
             .column(Column::initial(110.0))
             .column(Column::exact(90.0))
+            .column(Column::initial(240.0).clip(true))
             .column(Column::exact(80.0))
             .header(22.0, |mut header| {
-                for title in ["Player", "Pos", "Age", "OVR", "Salary/yr", "Contract until", "Release clause", "Months left", "ID"] {
+                for title in
+                    ["Player", "Pos", "Age", "OVR", "Salary/yr", "Contract until", "Release clause", "Months left", "Loan", "ID"]
+                {
                     header.col(|ui| {
                         ui.strong(title);
                     });
@@ -2048,12 +2154,13 @@ impl App {
                         opt(r.info.age),
                         opt(r.info.overall),
                         r.contract.map_or("no contract".into(), |c| self.to_display(c.annual_eur() as i64)),
-                        r.contract.map_or("on loan?".into(), |c| c.end.to_string()),
+                        r.contract.map_or(String::new(), |c| c.end.to_string()),
                         r.contract.map_or(String::new(), |c| match c.release_units {
                             0 => "none".into(),
                             u => self.to_display(u as i64 * 100),
                         }),
                         opt(r.months_left),
+                        r.status.clone(),
                         r.player.player_id.to_string(),
                     ];
                     for text in cells {
@@ -2081,12 +2188,18 @@ impl App {
         };
         let Some(contract) = row.contract else {
             theme::section_title(ui, "Contract");
-            ui.label(format!(
-                "{}: no contract with your club (for example a player on loan), so there is nothing to renew or release.",
-                row.info.name
-            ));
+            ui.label(match row.whereabouts {
+                Whereabouts::LoanedIn { .. } => format!(
+                    "{}: {}. His contract stays with his own club, so there is nothing to renew or release.",
+                    row.info.name,
+                    row.status.to_lowercase()
+                ),
+                _ => format!("{}: no contract with your club, so there is nothing to renew or release.", row.info.name),
+            });
             return;
         };
+        let loaned_out = matches!(row.whereabouts, Whereabouts::LoanedOut { .. });
+        let status = row.status.clone();
         let name = row.info.name.clone();
         let months_left = row.months_left;
         let ends: Vec<Date> = (1..=5).map(|n| game.contract_end_in(n)).collect();
@@ -2098,6 +2211,9 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             theme::section_title(ui, "Contract");
             ui.strong(format!("{name} · {current}/yr until {}", contract.end));
+            if loaned_out {
+                ui.label(RichText::new(&status).color(info));
+            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Salary per year:");
@@ -2133,6 +2249,13 @@ impl App {
         }
         ui.add_space(6.0);
         ui.separator();
+        if loaned_out {
+            ui.horizontal_wrapped(|ui| {
+                theme::section_title(ui, "Release");
+                ui.label("He is on loan: the game ends the loan first, so he can't be released now.");
+            });
+            return;
+        }
         let remaining = months_left.map(|m| contract.annual_eur() as i64 * m as i64 / 12);
         ui.horizontal_wrapped(|ui| {
             theme::section_title(ui, "Release");

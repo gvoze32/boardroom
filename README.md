@@ -211,6 +211,9 @@ as administrator too.
   none has been loaded in the game after editing yet. If a save's layout
   can't be measured, budget, manager and agreed deals are locked instead of
   guessed. The club list has all the world's clubs (5,080 in GigaPack).
+  Writing into the running game on a GigaPack world is untested: renewals of
+  players past the first 70,000 of the world's player table fail (the game
+  keeps them in another block of memory) and nothing is written.
 - **Manager name**: up to v0.3.3 the app showed and changed the wrong coach
   (another club's). It now changes your own manager.
 - **Writing into the running game** has not been tried in the game yet.

@@ -79,6 +79,13 @@ pub const COACH_NAME: usize = 8;
 pub const MANAGER_NAME_SIZE: usize = 46;
 /// Club record: handle (u32 coach index, u32 coach id) of the club's manager.
 pub const TEAM_COACH: usize = 0x28C;
+/// Lowest transfer budget a save is believed to hold (−500 million EUR).
+const MIN_TRANSFER_UNITS: i32 = -5_000_000;
+/// Club record: `0xFFFF_FFF5` here marks the club the user manages.
+const CLUB_USER_MARK: usize = 0x290;
+const USER_CLUB: u32 = 0xFFFF_FFF5;
+/// Club record: i32 transfer budget (units of 100 EUR), see `set_transfer_units`.
+const CLUB_BUDGET: usize = 0x644;
 pub const MY_TEAM_CLUB: usize = 0xB7_F804;
 pub const MY_TEAM: usize = 0xB7_F8BC;
 pub const MY_TEAM_ROW: usize = 16;
@@ -236,6 +243,15 @@ impl TransferRequest {
             name: None,
         }
     }
+}
+
+/// A player's running loan, as his record holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoanInfo {
+    /// Loan end; `None` when the record holds no date.
+    pub until: Option<Date>,
+    /// Club he joined from this season (for a loan in, the parent club).
+    pub from: Option<usize>,
 }
 
 /// A loan to or from the managed club.
@@ -571,7 +587,8 @@ impl MasterLeague {
         let off = self.layout.ok_or_else(not_found)?.upper(plain);
         let plausible = self.data.len() >= off + SALARY_BUDGET_OFFSET + 4
             && (4..SEASON_START_BUDGET_OFFSET).step_by(4).all(|gap| u32_at(&self.data, off + gap) == 0)
-            && u32_at(&self.data, off) < 0x8000_0000
+            // Signed: the game can take the transfer budget a little below zero.
+            && (MIN_TRANSFER_UNITS..).contains(&(u32_at(&self.data, off) as i32))
             && (1..0x8000_0000).contains(&u32_at(&self.data, off + SALARY_BUDGET_OFFSET));
         if plausible { Ok(off) } else { Err(not_found()) }
     }
@@ -1127,7 +1144,7 @@ impl MasterLeague {
     pub fn finances(&self) -> Result<Finances, Error> {
         let off = self.finance_at()?;
         Ok(Finances {
-            transfer_eur: u32_at(&self.data, off) as i64 * MONEY_UNIT,
+            transfer_eur: self.transfer_units(off) * MONEY_UNIT,
             salary_eur: u32_at(&self.data, off + SALARY_BUDGET_OFFSET) as i64 * MONEY_UNIT,
         })
     }
@@ -1141,13 +1158,43 @@ impl MasterLeague {
         Ok(())
     }
 
+    /// The transfer budget in units of 100 EUR. Signed: the game can take it
+    /// below zero (compensation paid in the game).
+    fn transfer_units(&self, off: usize) -> i64 {
+        u32_at(&self.data, off) as i32 as i64
+    }
+
+    /// Write the transfer budget, and the copy in your club's record when it
+    /// holds the same value: after a deal accepted in the game or a change of
+    /// club the game keeps the budget there too and takes it back from there,
+    /// so a change to the finance block alone would be lost (The Gaffer,
+    /// pc512s). A copy with another value is left alone.
+    fn set_transfer_units(&mut self, off: usize, units: i64) -> Result<(), Error> {
+        let old = self.transfer_units(off);
+        let value = i32::try_from(units).map_err(|_| Error::new("Transfer budget is too high or too low for the game."))?;
+        let copy = self.managed_team.map(Self::base).filter(|&b| {
+            u32_at(&self.data, b + CLUB_USER_MARK) == USER_CLUB && u32_at(&self.data, b + CLUB_BUDGET) as i32 as i64 == old
+        });
+        self.patch(off, &value.to_le_bytes());
+        if let Some(b) = copy {
+            self.patch(b + CLUB_BUDGET, &value.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Transfer budget += `delta_eur`. A payment may not take it below zero
+    /// (or lower when it already is); income is always added.
     fn adjust_transfer_budget(&mut self, delta_eur: i64) -> Result<(), Error> {
         let off = self.finance_at()?;
-        let units = u32_at(&self.data, off) as i64 + div_round_even(delta_eur, MONEY_UNIT);
-        if units < 0 {
-            return Err(Error::new(format!("Not enough transfer budget: {} short.", fmt_eur(-units * MONEY_UNIT))));
+        let old = self.transfer_units(off);
+        let delta = div_round_even(delta_eur, MONEY_UNIT);
+        let units = old + delta;
+        if delta < 0 && units < 0 {
+            // Already below zero: the whole payment is missing.
+            let short = if old < 0 { -delta } else { -units };
+            return Err(Error::new(format!("Not enough transfer budget: {} short.", fmt_eur(short * MONEY_UNIT))));
         }
-        self.set_u32(off, units.min(0x7FFF_FFFF), "Transfer budget")
+        self.set_transfer_units(off, units.min(i32::MAX as i64))
     }
 
     pub fn set_finances(&mut self, transfer_eur: i64, salary_eur: i64) -> Result<&Operation, Error> {
@@ -1159,7 +1206,10 @@ impl MasterLeague {
         self.atomic(Redo::Finances { transfer_eur, salary_eur }, move |g| {
             let mut changes = Vec::new();
             if transfer_eur != before.transfer_eur {
-                g.set_u32(off, eur_to_units(transfer_eur), "Transfer budget")?;
+                if transfer_eur < 0 {
+                    return Err(Error::new("Transfer budget is too high or too low for the game."));
+                }
+                g.set_transfer_units(off, eur_to_units(transfer_eur))?;
                 changes.push(format!("transfer budget {} → {}", fmt_eur(before.transfer_eur), fmt_eur(transfer_eur)));
             }
             if salary_eur != before.salary_eur {
@@ -1532,6 +1582,52 @@ impl MasterLeague {
     pub fn squad_contracts(&self) -> Vec<(Player, Option<Contract>)> {
         let Some(club) = self.managed_team else { return Vec::new() };
         self.club_roster(club).into_iter().map(|p| (p, self.contract_of(&p))).collect()
+    }
+
+    /// Players under contract with the managed club who play somewhere else
+    /// on loan: their contract stays with you, their roster slot is the other
+    /// club's (`None` when no club roster holds them).
+    pub fn loaned_out(&self) -> Vec<(Player, Contract, Option<usize>)> {
+        let (Some(table), Some(club)) = (self.contracts.as_ref(), self.managed_team) else { return Vec::new() };
+        let squad: HashSet<Player> = self.club_roster(club).into_iter().collect();
+        let away: Vec<Contract> = table
+            .contracts(&self.data, club)
+            .into_iter()
+            .filter(|c| !squad.contains(&Player { internal_id: c.internal_id, player_id: c.player_id }))
+            .collect();
+        if away.is_empty() {
+            return Vec::new();
+        }
+        let mut at: BTreeMap<Player, usize> = BTreeMap::new();
+        for i in (0..self.teams.len()).filter(|&i| i != club) {
+            for p in self.club_roster(i) {
+                at.entry(p).or_insert(i);
+            }
+        }
+        away.into_iter()
+            .map(|c| {
+                let p = Player { internal_id: c.internal_id, player_id: c.player_id };
+                (p, c, at.get(&p).copied())
+            })
+            .collect()
+    }
+
+    /// Loan details from the player's record: the loan end, and the club
+    /// he came from this season. `None` when he isn't on loan (or his
+    /// record can't be read).
+    pub fn loan_of(&self, player: &Player) -> Option<LoanInfo> {
+        let db = self.players.as_ref()?;
+        let off = db.record(&self.records, player).ok()?;
+        let r = &self.records[off..off + playerdb::RECORD];
+        let end = u32_at(r, playerdb::R_LOAN_END);
+        if r[playerdb::R_FLAGS] & playerdb::FLAG_LOAN == 0 && end == playerdb::NO_LOAN {
+            return None;
+        }
+        let from_ref = u32_at(r, playerdb::R_FROM_CLUB);
+        let from = (from_ref != playerdb::NO_CLUB)
+            .then_some((from_ref & 0x3FFF) as usize)
+            .filter(|&i| i < self.teams.len() && self.club_ref(i) == from_ref);
+        Some(LoanInfo { until: (end != playerdb::NO_LOAN).then(|| Date::unpack(end)).flatten(), from })
     }
 
     /// New yearly salary, end date and (when given; 0 = none) release clause

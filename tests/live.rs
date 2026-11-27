@@ -423,6 +423,23 @@ fn renewal_takes_a_player_off_hold() {
 }
 
 #[test]
+fn gigapack_date_is_found_past_the_mod_studio_range() {
+    // GigaPack's bigger player table pushes the calendar past 0x2600000.
+    let dir = TempDir::new("live-gigapack");
+    let (save, game) = edited(&dir);
+    game.put(TABLE + OFF_DATE, &[0; 4]);
+    let today = date(GAME_DATE.0, GAME_DATE.1, GAME_DATE.2);
+    let calendar = [date(2025, 7, 1).pack(), 37, date(2025, 8, 5).pack(), today.pack()];
+    let mut chunk = vec![0u8; 0x4_0010];
+    let at = 0x1000;
+    chunk[at..at + 16].copy_from_slice(&words(&calendar));
+    game.add(TABLE + 0x330_0000 - 16, chunk);
+    let (plan, _) = save.live_plan().unwrap();
+    live::apply(&plan, &game).unwrap();
+    assert_eq!(game.u32(saved(ml::FL26_FINANCE)), 800_000);
+}
+
+#[test]
 fn mod_studio_date_is_found_by_its_calendar() {
     let dir = TempDir::new("live-modstudio");
     let (save, game) = edited(&dir);

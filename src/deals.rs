@@ -77,7 +77,13 @@ const MAX_TIMELINE_SLOTS: usize = 64;
 /// News items, 56 bytes: type, internal id, player id, filler, then the date in the last word.
 pub const NEWS: usize = 0xBE_3360;
 pub const NEWS_ROW: usize = 56;
-const MAX_NEWS: usize = 256;
+/// The news list holds 200 rows; another structure follows it.
+const MAX_NEWS: usize = 200;
+/// Routine game event (the bulk of the list).
+const NEWS_GAME_EVENT: u32 = 0x1B;
+/// A full list reuses a game event at least this many days old, as the game
+/// keeps adding events to a full list (The Gaffer, FL27 careers).
+const NEWS_REUSE_DAYS: i64 = 60;
 const NEWS_DEAL_AGREED: u32 = 0x6E;
 const NEWS_LOAN_OUT_AGREED: u32 = 0x6F;
 const SEASON_PERMANENT: u32 = 1;
@@ -207,7 +213,10 @@ pub struct DealTables {
     /// Offset of the first free timeline slot.
     timeline_free: usize,
     news: usize,
-    news_free: usize,
+    /// First free news row; `None` when all are used.
+    news_free: Option<usize>,
+    /// Game events (row, date) a full list may reuse.
+    news_events: Vec<(usize, Date)>,
 }
 
 impl DealTables {
@@ -289,18 +298,47 @@ impl DealTables {
         })
         .ok_or_else(unknown)?;
         let timeline_free = timeline + timeline_slot * TIMELINE_SLOT;
-        let news_free = first_free(MAX_NEWS, |i| {
-            let w = u32s::<14>(data, news + i * NEWS_ROW)?;
-            Some(if w == BLANK_NEWS {
-                Entry::Free
-            } else if w[0] & 0xFF != 0xFF && w[13] != 0xFFFF && Date::unpack(w[13]).is_some() {
-                Entry::Used
-            } else {
-                Entry::Unknown
-            })
+        let mut news_free = None;
+        let mut news_events = Vec::new();
+        for i in 0..MAX_NEWS {
+            let w = u32s::<14>(data, news + i * NEWS_ROW).ok_or_else(unknown)?;
+            if w == BLANK_NEWS {
+                news_free = Some(i);
+                break;
+            }
+            let date = (w[0] & 0xFF != 0xFF).then(|| Date::unpack(w[13])).flatten().ok_or_else(unknown)?;
+            if w[0] == NEWS_GAME_EVENT {
+                news_events.push((i, date));
+            }
+        }
+        Ok(DealTables {
+            offers,
+            offer_count,
+            agreed_free,
+            pending,
+            pending_free,
+            season_deals,
+            deal_free,
+            timeline_free,
+            news,
+            news_free,
+            news_events,
         })
-        .ok_or_else(unknown)?;
-        Ok(DealTables { offers, offer_count, agreed_free, pending, pending_free, season_deals, deal_free, timeline_free, news, news_free })
+    }
+
+    /// Offset of the news row a deal agreed on `today` takes: the first free
+    /// one or, when the list is full, the oldest game event at least
+    /// `NEWS_REUSE_DAYS` old. Rows of deals are never reused.
+    fn news_row(&self, today: Date) -> Result<usize, Error> {
+        let row = self.news_free.or_else(|| {
+            self.news_events
+                .iter()
+                .filter(|(_, d)| today.day_number() - d.day_number() >= NEWS_REUSE_DAYS)
+                .min_by_key(|(i, d)| (d.day_number(), *i))
+                .map(|(i, _)| *i)
+        });
+        row.map(|i| self.news + i * NEWS_ROW)
+            .ok_or_else(|| Error::new("The game's news list is full; advance a few days in the game and try again."))
     }
 
     fn offer_rows(&self, data: &[u8]) -> Vec<[u32; 15]> {
@@ -384,7 +422,7 @@ impl DealTables {
             (self.season_deals + self.deal_free * DEAL_ENTRY, encode(season)),
             (self.timeline_free, Self::timeline_rounds(offer_id, rounds)),
             (table.first + AGREED_OFFSET + self.agreed_free * AGREED_ENTRY, agreed),
-            (self.news + self.news_free * NEWS_ROW, encode(news)),
+            (self.news_row(loan.today)?, encode(news)),
         ])
     }
 
@@ -447,7 +485,7 @@ impl DealTables {
         news[1] = p.internal_id;
         news[2] = p.player_id;
         news[13] = deal.today.pack();
-        patches.push((self.news + self.news_free * NEWS_ROW, encode(news)));
+        patches.push((self.news_row(deal.today)?, encode(news)));
         Ok(patches)
     }
 }
