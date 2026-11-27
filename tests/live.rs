@@ -308,6 +308,8 @@ fn release_clause_and_manager_name_reach_the_running_game() {
 
 /// The save with a renewal request of the managed club open for `j` (a
 /// negotiation row) and his renewal state row set to `state`.
+const STATE_ROW_X: u32 = 0xC400_0000;
+
 fn with_request(j: usize, state: u32) -> Vec<u8> {
     let mut data = build_data(false);
     let p = club_player(MANAGED, j);
@@ -317,9 +319,12 @@ fn with_request(j: usize, state: u32) -> Vec<u8> {
     // State rows behind the player records, ~15 KB before the end.
     let mut extra = vec![0u8; 0x4000];
     let at = 0x500;
+    // The last word's high byte varies per player (FL27); the rest is zero.
     extra[at - 16..at - 8].copy_from_slice(&key(j - 1));
+    extra[at - 4..at].copy_from_slice(&0xD600_0000u32.to_le_bytes());
     extra[at..at + 8].copy_from_slice(&key(j));
     extra[at + 8..at + 12].copy_from_slice(&state.to_le_bytes());
+    extra[at + 12..at + 16].copy_from_slice(&STATE_ROW_X.to_le_bytes());
     let tail_len = TAIL.len() + extra.len();
     data.extend(extra);
     put_words(&mut data, PLAYERS_AT - 12, &[tail_len as u32]);
@@ -401,6 +406,20 @@ fn renewal_of_a_player_who_refused_is_saved_to_the_file() {
     save.write(None).unwrap();
     let again = MasterLeague::open(&save.path).unwrap();
     assert_eq!(u32_at(&again.data, again.data.len() - 0x4000 + 0x500 + 8), 0);
+    assert_eq!(u32_at(&again.data, again.data.len() - 0x4000 + 0x500 + 12), STATE_ROW_X, "high byte kept");
+}
+
+#[test]
+fn renewal_takes_a_player_off_hold() {
+    let dir = TempDir::new("live-hold");
+    let mut data = with_request(6, 2);
+    // On Hold (state 2) without an open request, as Quenda in a real FL27 save.
+    put_words(&mut data, FIRST_ROW + (SQUAD + 1) * boardroom::contracts::RECORD, &boardroom::contracts::BLANK);
+    let mut save = open_data(&dir, data);
+    save.renew_contract(club_player(MANAGED, 6), 3_000_000, date(2031, 6, 30), None, None).unwrap();
+    save.write(None).unwrap();
+    let again = MasterLeague::open(&save.path).unwrap();
+    assert_eq!(u32_at(&again.data, again.data.len() - 0x4000 + 0x500 + 8), 0, "no longer On Hold");
 }
 
 #[test]

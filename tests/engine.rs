@@ -857,3 +857,11 @@ fn dotted_date_in_the_description_is_read() {
     let path = write_save_as(&dir.0.join("ML00000001"), build_data(false), "SP Football Life 2027", "Club 0 / Bundesliga\n12.9.2026\nBundesliga");
     assert_eq!(MasterLeague::open(&path).unwrap().game_date, Some(date(2026, 9, 12)));
 }
+
+#[test]
+fn date_with_time_in_the_description_is_read() {
+    // Saved during a day, e.g. the last day of the transfer window.
+    let dir = TempDir::new("timed-date");
+    let path = write_save_as(&dir.0.join("ML00000001"), build_data(false), "SP Football Life 2027", "Club 0 / Premier League\n31/8/2027 14:00\nPremier League");
+    assert_eq!(MasterLeague::open(&path).unwrap().game_date, Some(date(2027, 8, 31)));
+}

@@ -889,13 +889,17 @@ pub fn apply(plan: &Plan, mem: &dyn Memory) -> Result<Report, Error> {
             let set = if r.release > 0 { flags | HAS_RELEASE_CLAUSE } else { flags & !HAS_RELEASE_CLAUSE };
             writes.push((record + R_FLAGS as u64, word(set), word(flags)));
         }
-        // Renewal state rows `(key, state, 0)`, after a row of the same kind.
+        // Renewal state rows `(key, state, x)`, after a row of the same kind;
+        // only x's high byte may be set.
         if let Some(n) = state_needle[i] {
             let lo = u32_at(key, 0);
             for &a in &hits[n] {
                 let Some(row) = a.checked_sub(16).and_then(|s| read_vec(mem, s, 32)) else { continue };
                 let (prev, state, zero) = (u32_at(&row, 0), u32_at(&row, 24), u32_at(&row, 28));
-                if (1..=3).contains(&state) && zero == 0 && prev >> 16 == lo >> 16 {
+                if (1..=3).contains(&state)
+                    && zero & crate::masterleague::STATE_ROW_ZERO_MASK == 0
+                    && prev >> 16 == lo >> 16
+                {
                     writes.push((a + 8, word(0), word(state)));
                 }
             }

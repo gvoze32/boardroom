@@ -87,6 +87,9 @@ const MY_TEAM_FREE: u32 = 0xC7;
 pub const MONEY_UNIT: i64 = 100;
 /// Bytes at the end of the data block searched for a player's renewal state row.
 const RENEWAL_STATE_WINDOW: usize = 0x10000;
+/// Bytes of a renewal state row's last word that are always zero; the high
+/// byte varies per player.
+pub(crate) const STATE_ROW_ZERO_MASK: u32 = 0x00FF_FFFF;
 
 pub const NATIONAL_FIRST: [&str; 4] = ["ALB", "AND", "ARM", "AUT"];
 const NATIONAL_FIRST_NAMES: [&str; 4] = ["albania", "andorra", "armenia", "austria"];
@@ -427,7 +430,8 @@ impl MasterLeague {
     }
 
     /// `"Chelsea FC / Premier League\n6/8/2025\nPremier League"` at desc+0x80;
-    /// a German game writes the date as `12.9.2026`.
+    /// a German game writes the date as `12.9.2026`; a save made during a
+    /// day adds the time (`31/8/2027 14:00`).
     fn read_description(&mut self) {
         let raw = self.save.desc.get(0x80..).unwrap_or(&[]);
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -440,7 +444,8 @@ impl MasterLeague {
         }
         self.league_name = first.and_then(|mut parts| parts.next()).map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
         self.game_date = lines.next().and_then(|line| {
-            let mut parts = line.trim().split(['/', '.']).map(|p| p.parse::<u16>().ok());
+            let date = line.split_whitespace().next()?;
+            let mut parts = date.split(['/', '.']).map(|p| p.parse::<u16>().ok());
             let (d, m, y) = (parts.next()??, parts.next()??, parts.next()??);
             Date::new(y, u8::try_from(m).ok()?, u8::try_from(d).ok()?)
         });
@@ -1003,17 +1008,21 @@ impl MasterLeague {
 }
 
 /// The game's renewal state row of the player: 16 bytes `(internal id,
-/// player id, state, 0)` about 15 KB before the end of the data block, one
-/// per player of the managed squad; 1 = renewal requested, 3 = refused (he
-/// leaves when the contract ends). -> offset of the state word when it is
-/// set, and only when exactly one such row exists.
+/// player id, state, x)` about 15 KB before the end of the data block, one
+/// per player of the managed squad; 1 = renewal requested, 2 = On Hold,
+/// 3 = refused (he leaves when the contract ends). `x` has its low three
+/// bytes zero; its high byte is a per-player value the game keeps (FL27).
+/// -> offset of the state word when it is set, and only when exactly one
+/// such row exists.
 fn renewal_state(data: &[u8], player: &Player) -> Option<usize> {
     let from = data.len().saturating_sub(RENEWAL_STATE_WINDOW);
     let mut key = player.internal_id.to_le_bytes().to_vec();
     key.extend(player.player_id.to_le_bytes());
     let found: Vec<usize> = memchr::memmem::find_iter(&data[from..], &key)
         .map(|i| from + i + 8)
-        .filter(|&o| o + 8 <= data.len() && (1..=3).contains(&u32_at(data, o)) && u32_at(data, o + 4) == 0)
+        .filter(|&o| {
+            o + 8 <= data.len() && (1..=3).contains(&u32_at(data, o)) && u32_at(data, o + 4) & STATE_ROW_ZERO_MASK == 0
+        })
         .collect();
     (found.len() == 1).then(|| found[0])
 }
