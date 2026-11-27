@@ -2,7 +2,7 @@
 
 Each release on GitHub shows the section for its version.
 
-## Unreleased
+## v0.3.6
 
 ### Added
 - **My squad & contracts**: search by name or ID, a filter for players in the squad, loaned in or loaned out,
